@@ -42,6 +42,10 @@ RUN set -eu; \
     check xhttp_network grep -q 'type":"xhttp"' /opt/xray/scripts/generate.py; \
     check cloudflare_xhttp_tls grep -q 'cloudflare-xhttp-tls' /opt/xray/scripts/generate.py; \
     check tcp_proxy_target grep -q 'tcp_proxy_expected_target":8080' /opt/xray/scripts/runtime-manifest.py; \
+    check networking_domain_count grep -q 'RAILWAY_API_PUBLIC_DOMAIN_CONFIG_COUNT=' /opt/xray/scripts/railway_setup.py; \
+    check networking_domain_reconcile grep -q 'RAILWAY_API_PUBLIC_DOMAIN=RECONCILED count=1' /opt/xray/scripts/railway_setup.py; \
+    check networking_tcp_count grep -q 'RAILWAY_API_TCP_PROXY_CONFIG_COUNT=' /opt/xray/scripts/railway_setup.py; \
+    check networking_tcp_ambiguous grep -q 'multiple Railway TCP proxies target application port 8080' /opt/xray/scripts/railway_setup.py; \
     check no_ws_legacy sh -c '! grep -q "cloudflare-ws-tls" /opt/xray/scripts/generate.py'; \
     check no_ws_transport sh -c '! grep -q "type\\\":\\\"ws\\\"" /opt/xray/scripts/generate.py'; \
     check no_runtime_identity_generation sh -c '! grep -q "secrets.token_" /opt/xray/scripts/generate.py'; \
