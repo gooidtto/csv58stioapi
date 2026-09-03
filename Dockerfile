@@ -13,9 +13,7 @@ COPY --from=cloudflared /usr/local/bin/cloudflared /usr/local/bin/cloudflared
 COPY scripts/ /opt/xray/scripts/
 COPY config/ /opt/xray/config/
 COPY site/ /opt/xray/site/
-# Keep runtime source immutable: never patch protocol definitions during image build.
-# The build must fail if Node 5 regresses to the deprecated WebSocket transport,
-# or if node identity is no longer initialized once and then reused forever.
+# Build-time invariants: Node 5 stays XHTTP, and node identity is initialized once.
 RUN python3 -m py_compile /opt/xray/scripts/*.py && \
     test -x /opt/xray/scripts/identity-init.py && \
     grep -q 'vless-xhttp-cloudflare' /opt/xray/scripts/generate.py && \
