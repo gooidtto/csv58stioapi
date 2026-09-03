@@ -29,6 +29,37 @@ REALITY_KEY_RE = re.compile(r"^[A-Za-z0-9_-]{32,64}$")
 SHORT_ID_RE = re.compile(r"^[0-9a-fA-F]{2,32}$")
 
 
+def persistent_mount_present(path: Path) -> bool:
+    """Require the identity directory to be an actual mount point.
+
+    A Railway Volume must be mounted here before identity is ever initialized.
+    Checking /proc/self/mountinfo avoids relying on the optional `mountpoint`
+    utility, which is not installed in the Alpine runtime image.
+    """
+    try:
+        target = str(path.resolve())
+        if target == "/":
+            return False
+        if not os.path.ismount(target):
+            return False
+        with open("/proc/self/mountinfo", "r", encoding="utf-8") as fh:
+            for line in fh:
+                fields = line.split()
+                if len(fields) >= 6 and fields[4] == target:
+                    return True
+    except (OSError, ValueError):
+        return False
+    return False
+
+
+def require_persistent_mount() -> None:
+    if not persistent_mount_present(D):
+        raise SystemExit(
+            f"FATAL: {D} is not a mounted persistent volume; "
+            "refusing to initialize or run node identity"
+        )
+
+
 def atomic_write(path: Path, value: str) -> None:
     tmp = path.with_name(f".{path.name}.tmp.{os.getpid()}.{secrets.token_hex(4)}")
     try:
@@ -108,8 +139,9 @@ def generate_identity() -> None:
     token = secrets.token_urlsafe(32)
     ids = [secrets.token_hex(6) for _ in range(3)]
 
-    # Write the complete set only after every generated value has passed
-    # validation. Each file is atomically replaced; the marker is written last.
+    # Every individual file is atomically replaced and fsynced. The marker is
+    # written last, so an interrupted first initialization can never be mistaken
+    # for a successfully initialized identity. Any incomplete set is fail-closed.
     atomic_write(UUID_FILE, uuid)
     atomic_write(PRIV_FILE, private)
     atomic_write(PUB_FILE, public)
@@ -122,6 +154,11 @@ def write_marker() -> None:
 
 
 def main() -> None:
+    # Never initialize identity into the container's ephemeral writable layer.
+    # This check also protects an already-initialized deployment if its Railway
+    # Volume becomes unavailable after a restart.
+    require_persistent_mount()
+
     marked = MARKER.is_file()
     complete = identity_complete()
 
@@ -132,6 +169,7 @@ def main() -> None:
                 "refusing to rotate identity"
             )
         print(f"PERSISTENT_VOLUME={D}")
+        print("PERSISTENT_VOLUME_MOUNT=PASS")
         print("NODE_IDENTITY=REUSED")
         return
 
@@ -141,6 +179,7 @@ def main() -> None:
     if complete:
         write_marker()
         print(f"PERSISTENT_VOLUME={D}")
+        print("PERSISTENT_VOLUME_MOUNT=PASS")
         print("NODE_IDENTITY=REUSED_INITIALIZED")
         return
 
@@ -155,6 +194,7 @@ def main() -> None:
         raise SystemExit("FATAL: node identity initialization did not produce a complete identity set")
     write_marker()
     print(f"PERSISTENT_VOLUME={D}")
+    print("PERSISTENT_VOLUME_MOUNT=PASS")
     print("NODE_IDENTITY=INITIALIZED")
 
 
