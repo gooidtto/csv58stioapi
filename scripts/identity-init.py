@@ -6,6 +6,7 @@ volume may be initialized once. Once the marker exists, the complete identity
 must remain present and valid; otherwise startup fails closed and no identity
 is regenerated.
 """
+import hashlib
 import json
 import os
 import re
@@ -114,6 +115,21 @@ def identity_complete() -> bool:
     return all(isinstance(x, str) and SHORT_ID_RE.fullmatch(x) for x in ids)
 
 
+def identity_fingerprint() -> str:
+    """Return a non-secret stable fingerprint for deployment log verification."""
+    uuid = read_nonempty(UUID_FILE)
+    public = read_nonempty(PUB_FILE)
+    digest = hashlib.sha256(f"{uuid}\n{public}".encode()).hexdigest()
+    return digest[:16]
+
+
+def emit_identity_status(state: str) -> None:
+    print(f"PERSISTENT_VOLUME={D}")
+    print("PERSISTENT_VOLUME_MOUNT=PASS")
+    print(f"NODE_IDENTITY={state}")
+    print(f"NODE_IDENTITY_FINGERPRINT={identity_fingerprint()}")
+
+
 def generate_identity() -> None:
     uuid = subprocess.check_output(["xray", "uuid"], text=True).strip()
     if not UUID_RE.fullmatch(uuid):
@@ -128,10 +144,8 @@ def generate_identity() -> None:
         elif line.startswith("Password (PublicKey):"):
             public = line.split(":", 1)[1].strip()
         elif line.startswith("Password:"):
-            # Compatibility with Xray builds that omit the parenthetical label.
             public = line.split(":", 1)[1].strip()
         elif line.startswith("PublicKey:"):
-            # Compatibility with older Xray output.
             public = line.split(":", 1)[1].strip()
     if not REALITY_KEY_RE.fullmatch(private) or not REALITY_KEY_RE.fullmatch(public):
         raise RuntimeError("xray generated an invalid REALITY key pair")
@@ -154,9 +168,6 @@ def write_marker() -> None:
 
 
 def main() -> None:
-    # Never initialize identity into the container's ephemeral writable layer.
-    # This check also protects an already-initialized deployment if its Railway
-    # Volume becomes unavailable after a restart.
     require_persistent_mount()
 
     marked = MARKER.is_file()
@@ -168,19 +179,12 @@ def main() -> None:
                 "FATAL: node identity was previously initialized but is missing or invalid; "
                 "refusing to rotate identity"
             )
-        print(f"PERSISTENT_VOLUME={D}")
-        print("PERSISTENT_VOLUME_MOUNT=PASS")
-        print("NODE_IDENTITY=REUSED")
+        emit_identity_status("REUSED")
         return
 
-    # A complete set without a marker is treated as an already-existing
-    # identity rather than a reason to rotate it. This makes the transition
-    # safe for a volume created by the previous implementation.
     if complete:
         write_marker()
-        print(f"PERSISTENT_VOLUME={D}")
-        print("PERSISTENT_VOLUME_MOUNT=PASS")
-        print("NODE_IDENTITY=REUSED_INITIALIZED")
+        emit_identity_status("REUSED_INITIALIZED")
         return
 
     if any(p.exists() for p in IDENTITY_FILES):
@@ -193,9 +197,7 @@ def main() -> None:
     if not identity_complete():
         raise SystemExit("FATAL: node identity initialization did not produce a complete identity set")
     write_marker()
-    print(f"PERSISTENT_VOLUME={D}")
-    print("PERSISTENT_VOLUME_MOUNT=PASS")
-    print("NODE_IDENTITY=INITIALIZED")
+    emit_identity_status("INITIALIZED")
 
 
 if __name__ == "__main__":
