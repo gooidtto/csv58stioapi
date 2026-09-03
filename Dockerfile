@@ -6,14 +6,14 @@ FROM cloudflare/cloudflared:${CLOUDFLARED_VERSION} AS cloudflared
 FROM python:3.12-alpine3.22
 ARG XRAY_VERSION
 ARG CLOUDFLARED_VERSION
-ENV XRAY_VERSION=${XRAY_VERSION} CLOUDFLARED_VERSION=${CLOUDFLARED_VERSION} PYTHONUNBUFFERED=1 PYTHONDONTWRITEBYTECODE=1
+ENV XRAY_VERSION=${XRAY_VERSION} CLOUDFLARED_VERSION=${CLOUDFLARED_VERSION} PYTHONUNBUFFERED=1 PYTHONDONTWRITEBYTECODE=1 NODE_IDENTITY_POLICY=INITIALIZE_ONCE_REUSE_FOREVER
 RUN apk add --no-cache openssl ca-certificates && mkdir -p /etc/xray /data /opt/xray/scripts /opt/xray/config /opt/xray/site
 COPY --from=xray /usr/local/bin/xray /usr/local/bin/xray
 COPY --from=cloudflared /usr/local/bin/cloudflared /usr/local/bin/cloudflared
 COPY scripts/ /opt/xray/scripts/
 COPY config/ /opt/xray/config/
 COPY site/ /opt/xray/site/
-# Build-time invariants: Node 5 stays XHTTP, and node identity is initialized once.
+# Build-time invariants: runtime artifacts are derived, while node identity is initialized once and reused forever.
 RUN python3 -m py_compile /opt/xray/scripts/*.py && \
     test -x /opt/xray/scripts/identity-init.py && \
     grep -q 'vless-xhttp-cloudflare' /opt/xray/scripts/generate.py && \
@@ -22,6 +22,9 @@ RUN python3 -m py_compile /opt/xray/scripts/*.py && \
     grep -q 'tcp_proxy_expected_target":8080' /opt/xray/scripts/runtime-manifest.py && \
     grep -q 'identity-init.py' /opt/xray/scripts/boot.sh && \
     grep -q 'NODE_IDENTITY_POLICY=INITIALIZE_ONCE_REUSE_FOREVER' /opt/xray/scripts/boot.sh && \
+    grep -q 'NODE_IDENTITY=REUSED' /opt/xray/scripts/identity-init.py && \
+    grep -q 'refusing to rotate identity' /opt/xray/scripts/identity-init.py && \
+    grep -q 'Short IDs are part of node identity' /opt/xray/scripts/generate.py && \
     grep -q 'GATEWAY_BIND_EARLY=PASS' /opt/xray/scripts/boot.sh && \
     grep -q 'DEPLOYMENT SUMMARY' /opt/xray/scripts/boot.sh && \
     grep -q 'application/json' /opt/xray/scripts/gateway.py && \
@@ -30,6 +33,7 @@ RUN python3 -m py_compile /opt/xray/scripts/*.py && \
     grep -q 'same persisted' /opt/xray/scripts/supervise.sh && \
     ! grep -q 'cloudflare-ws-tls' /opt/xray/scripts/generate.py && \
     ! grep -q 'type":"ws"' /opt/xray/scripts/generate.py && \
+    ! grep -q 'secrets.token_' /opt/xray/scripts/generate.py && \
     chmod 0755 /usr/local/bin/xray /usr/local/bin/cloudflared /opt/xray/scripts/*.sh /opt/xray/scripts/*.py && \
     chmod 0644 /opt/xray/config/* /opt/xray/site/*
 RUN echo "SOURCE_BUILD=runtime-derived BUILD_ID=runtime-derived NODE5=VLESS_XHTTP_TLS_CLOUDFLARE NODE_IDENTITY=INITIALIZE_ONCE_REUSE_FOREVER"
