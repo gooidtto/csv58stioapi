@@ -22,7 +22,8 @@ cleanup() { if [ -n "${BOOT_PID:-}" ]; then kill -TERM "$BOOT_PID" 2>/dev/null |
 trap cleanup INT TERM EXIT
 
 start_boot() {
-  /opt/xray/scripts/boot.sh >>"$LOG" 2>&1 &
+  # Mirror boot output to Railway logs as well as the persistent diagnostic log.
+  /opt/xray/scripts/boot.sh 2>&1 | tee -a "$LOG" &
   BOOT_PID=$!
   log "BOOT_STARTED pid=$BOOT_PID"
 }
@@ -50,6 +51,9 @@ while [ "$elapsed" -lt "$STARTUP_GRACE" ]; do
       continue
     fi
     log "BOOT_EXITED_DURING_STARTUP rc=${BOOT_RC}"
+    log "BOOT_DIAGNOSTIC_TAIL_BEGIN"
+    tail -120 "$LOG" 2>/dev/null || true
+    log "BOOT_DIAGNOSTIC_TAIL_END"
     exit 1
   fi
   sleep "$CHECK_INTERVAL"
