@@ -78,26 +78,19 @@ export RAILWAY_TCP_PROXY_TARGET_PORT=8080
 export RAILWAY_NETWORKING_SOURCE=current-deployment-environment
 export RAILWAY_NETWORKING_AUTHORITATIVE=true
 export RAILWAY_TCP_PROXY_DOMAIN="$TCP_HOST" RAILWAY_TCP_PROXY_PORT="$TCP_PORT" PUBLIC_DOMAIN="$PUBLIC_DOMAIN"
+
+# Initialize identity only on the mounted persistent volume. Existing identity
+# files are never overwritten. This makes first deployment self-initializing and
+# all later redeploy/restart cycles identity-stable.
+python3 /opt/xray/scripts/volume-init.py
 UUID_FILE="$D/uuid.txt"
-if [ -s "$UUID_FILE" ]; then
-  UUID="$(tr -d '[:space:]' <"$UUID_FILE")"
-  printf '%s' "$UUID" | grep -Eq '^[0-9a-fA-F-]{16,64}$' || { echo "FATAL: persisted UUID is invalid" >&2; exit 1; }
-else
-  UUID="$(xray uuid)"
-  write_secret "$UUID_FILE" "$UUID"
-fi
+UUID="$(tr -d '[:space:]' <"$UUID_FILE")"
+printf '%s' "$UUID" | grep -Eq '^[0-9a-fA-F-]{16,64}$' || { echo "FATAL: persisted UUID is invalid" >&2; exit 1; }
 PRIV_FILE="$D/reality_private_key.txt"; PUB_FILE="$D/reality_public_key.txt"
-if [ -s "$PRIV_FILE" ] && [ -s "$PUB_FILE" ]; then
-  PRIVATE_KEY="$(tr -d '[:space:]' <"$PRIV_FILE")"; PUBLIC_KEY="$(tr -d '[:space:]' <"$PUB_FILE")"
-else
-  OUT="$(xray x25519 2>&1)"
-  PRIVATE_KEY="$(printf '%s\n' "$OUT" | awk -F': ' '/^PrivateKey/{print $2;exit}')"
-  PUBLIC_KEY="$(printf '%s\n' "$OUT" | awk -F': ' '/^Password/{print $2;exit}')"
-  [ -n "$PRIVATE_KEY" ] && [ -n "$PUBLIC_KEY" ] || { echo "FATAL: failed to generate REALITY keys" >&2; exit 1; }
-  write_secret "$PRIV_FILE" "$PRIVATE_KEY"; write_secret "$PUB_FILE" "$PUBLIC_KEY"
-fi
-TOKEN_FILE="$D/subscription_token.txt"
-if [ -s "$TOKEN_FILE" ]; then TOKEN="$(tr -d '[:space:]' <"$TOKEN_FILE")"; else TOKEN="$(python3 -c 'import secrets;print(secrets.token_urlsafe(32))')"; write_secret "$TOKEN_FILE" "$TOKEN"; fi
+PRIVATE_KEY="$(tr -d '[:space:]' <"$PRIV_FILE")"; PUBLIC_KEY="$(tr -d '[:space:]' <"$PUB_FILE")"
+[ -n "$PRIVATE_KEY" ] && [ -n "$PUBLIC_KEY" ] || { echo "FATAL: persisted REALITY key files are incomplete" >&2; exit 1; }
+TOKEN_FILE="$D/subscription_token.txt"; TOKEN="$(tr -d '[:space:]' <"$TOKEN_FILE")"
+[ -n "$TOKEN" ] || { echo "FATAL: persisted subscription token is empty" >&2; exit 1; }
 export UUID PRIVATE_KEY PUBLIC_KEY
 export REALITY_RAW_SNI="${REALITY_RAW_SNI:-www.cloudflare.com}" REALITY_RAW_TARGET="${REALITY_RAW_TARGET:-www.cloudflare.com:443}"
 export REALITY_FINGERPRINT="${REALITY_FINGERPRINT:-chrome}" REALITY_XHTTP_SNI="${REALITY_XHTTP_SNI:-www.apple.com}" REALITY_XHTTP_TARGET="${REALITY_XHTTP_TARGET:-www.apple.com:443}"
@@ -226,85 +219,4 @@ echo "GATEWAY_BIND_EARLY=PASS"
 echo "NODES=$(python3 -c 'import json;print(json.load(open("'"$RUNTIME"'"))["nodes"]["count"])')"
 echo "SUBSCRIPTION_CHECK=PASS"
 echo "XRAY=READY"
-if [ "$CF_ENABLED" = "1" ]; then echo "CLOUDFLARE=enabled"; echo "TRANSPORT=XHTTP_TLS"; else echo "CLOUDFLARE=disabled"; fi
-echo "GATEWAY=READY"
-echo "========================================="
-# Application readiness: all four local Xray listeners must be accepting
-# before the deployment is considered ready.
-for PORT in 10086 10087 10088 10089; do
-  READY=0
-  for _ in $(seq 1 30); do
-    if nc -z 127.0.0.1 "$PORT" 2>/dev/null; then
-      READY=1
-      break
-    fi
-    sleep 1
-  done
-  if [ "$READY" -ne 1 ]; then
-    echo "FATAL: Xray port $PORT did not become ready" >&2
-    exit 1
-  fi
-  echo "XRAY_PORT_READY=PASS port=$PORT"
-done
-echo "APPLICATION_READINESS=PASS"
-
-# Final operator-facing report. /health remains liveness; /ready is queried
-# only after all Xray listeners are confirmed ready.
-python3 - "$PUBLIC_DOMAIN" "$TOKEN" "$D" "$CF_ENABLED" "${CF_PORT_STATE:-}" <<'PY_REPORT'
-import socket
-import sys
-import urllib.request
-import json
-from pathlib import Path
-
-public, token, data_dir, cf_enabled, cf_port = sys.argv[1:]
-d = Path(data_dir)
-runtime = json.loads((d / "runtime.json").read_text())
-nodes = int(runtime.get("nodes", {}).get("count", 0) or 0)
-
-print("========== CLIENT ACCESS ==========")
-print(f"SUBSCRIPTION_URL=https://{public}/sub/{token}")
-print(f"SUBSCRIPTION_NODES={nodes}")
-
-ports = {1: 10086, 2: 10087, 3: 10088, 4: 10089}
-for n, port in ports.items():
-    try:
-        with socket.create_connection(("127.0.0.1", port), timeout=1.5):
-            print(f"NODE{n}=READY local_port={port}")
-    except OSError as exc:
-        print(f"NODE{n}=NOT_READY local_port={port} reason={type(exc).__name__}")
-
-if nodes == 5:
-    try:
-        p = int(cf_port)
-        with socket.create_connection(("127.0.0.1", p), timeout=1.5):
-            print(f"NODE5=READY local_port={p} transport=XHTTP_TLS_CLOUDFLARE")
-    except Exception as exc:
-        print(f"NODE5=NOT_READY local_port={cf_port} transport=XHTTP_TLS_CLOUDFLARE reason={type(exc).__name__}")
-
-try:
-    with urllib.request.urlopen("http://127.0.0.1:8080/ready", timeout=5) as r:
-        body = r.read().decode(errors="replace")
-        print(f"READY_ENDPOINT=HTTP_{r.status}")
-        print(f"READY_STATUS={body}")
-except Exception as exc:
-    print(f"READY_ENDPOINT=ERROR {type(exc).__name__}:{exc}")
-
-print("===================================")
-PY_REPORT
-
-echo "READY_ENDPOINT_EXPECTED=200"
-
-# Process supervision: if Gateway or Xray exits, terminate the container so
-# Railway restartPolicy can restart the whole service cleanly.
-while true; do
-  if ! kill -0 "$GP" 2>/dev/null; then
-    echo "FATAL: Gateway process exited; restarting container" >&2
-    exit 1
-  fi
-  if ! kill -0 "$XP" 2>/dev/null; then
-    echo "FATAL: Xray process exited; restarting container" >&2
-    exit 1
-  fi
-  sleep 2
-done
+if [ "$CF_ENABLED" = "1" ]; then echo "CLOUDFLARE=READY"; else echo "CLOUDFLARE=DISABLED"; fi

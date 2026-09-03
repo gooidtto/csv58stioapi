@@ -17,11 +17,12 @@ COPY site/ /opt/xray/site/
 # The build must fail if Node 5 regresses to the deprecated WebSocket transport,
 # or if the runtime loses the Railway endpoint/8080 invariants.
 RUN python3 -m py_compile /opt/xray/scripts/*.py && \
+    test -x /opt/xray/scripts/volume-init.py && \
     grep -q 'vless-xhttp-cloudflare' /opt/xray/scripts/generate.py && \
     grep -q 'type":"xhttp"' /opt/xray/scripts/generate.py && \
     grep -q 'cloudflare-xhttp-tls' /opt/xray/scripts/generate.py && \
     grep -q 'tcp_proxy_expected_target":8080' /opt/xray/scripts/runtime-manifest.py && \
-    grep -q 'write_secret()' /opt/xray/scripts/boot.sh && \
+    grep -q 'volume-init.py' /opt/xray/scripts/boot.sh && \
     grep -q 'GATEWAY_BIND_EARLY=PASS' /opt/xray/scripts/boot.sh && \
     grep -q 'DEPLOYMENT SUMMARY' /opt/xray/scripts/boot.sh && \
     grep -q 'application/json' /opt/xray/scripts/gateway.py && \
