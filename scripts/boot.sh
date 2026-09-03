@@ -1,7 +1,7 @@
 #!/bin/sh
 # Railway Universal Stable V5 - networking-safe startup.
-# The TCP Proxy targets port 8080. Bind that port BEFORE starting Xray so
-# Railway can attach/verify the proxy target during the first deployment.
+# Identity rule: initialize once on the persistent volume, then reuse forever.
+# Runtime/network artifacts remain derived from the current deployment.
 set -eu
 umask 077
 REPOSITORY_IDENTITY="$(python3 /opt/xray/scripts/version.py 2>/dev/null || echo runtime)"
@@ -9,21 +9,10 @@ export RELEASE="$REPOSITORY_IDENTITY" BUILD_ID="$REPOSITORY_IDENTITY" SOURCE_BUI
 D="${RAILWAY_VOLUME_MOUNT_PATH:-${DATA_DIR:-/data}}"
 mkdir -p "$D"
 
-write_secret() {
-  _file="$1"
-  _value="$2"
-  _tmp="${_file}.tmp.$$"
-  printf '%s\n' "$_value" >"$_tmp"
-  chmod 0600 "$_tmp"
-  mv -f "$_tmp" "$_file"
-}
-
-# Gateway early bind: keep Railway target port 8080 alive before
-# networking/runtime/Xray readiness work begins.
+# Gateway early bind: keep Railway target port 8080 alive before startup work.
 python3 /opt/xray/scripts/gateway.py >"$D/gateway.log" 2>&1 & GP=$!
-# Optional Railway infrastructure bootstrap. Only call the Railway API when
-# the current deployment does not already expose the required networking values.
-# Gateway is already bound to 8080 before this block.
+
+# Optional Railway infrastructure bootstrap. Only used when required networking values are absent.
 if [ -z "${RAILWAY_PUBLIC_DOMAIN:-}" ] || [ -z "${RAILWAY_TCP_PROXY_DOMAIN:-}" ] || [ -z "${RAILWAY_TCP_PROXY_PORT:-}" ]; then
   if [ -n "${RAILWAY_TOKEN:-}" ] || [ -n "${RAILWAY_API_TOKEN:-}" ]; then
     python3 /opt/xray/scripts/railway_setup.py
@@ -33,7 +22,7 @@ if [ -z "${RAILWAY_PUBLIC_DOMAIN:-}" ] || [ -z "${RAILWAY_TCP_PROXY_DOMAIN:-}" ]
       exit 0
     fi
     if [ "$API_SETUP_RC" -ne 0 ]; then
-      echo "FATAL: Railway API networking setup failed; refusing to generate incomplete nodes" >&2
+      echo "FATAL: Railway API networking setup failed; refusing to continue" >&2
       exit 1
     fi
   fi
@@ -42,20 +31,14 @@ fi
 PUBLIC_DOMAIN="${RAILWAY_PUBLIC_DOMAIN:-}"
 TCP_HOST="${RAILWAY_TCP_PROXY_DOMAIN:-}"
 TCP_PORT="${RAILWAY_TCP_PROXY_PORT:-}"
-
-# Fresh Railway projects can start the container before Networking has fully
-# settled. Keep the liveness Gateway available, then use a bounded retry window
-# before declaring the deployment unusable. Persisted endpoints are never used.
 NETWORK_DISCOVERY_TIMEOUT="${RAILWAY_NETWORK_DISCOVERY_TIMEOUT:-180}"
 NETWORK_DISCOVERY_INTERVAL="${RAILWAY_NETWORK_DISCOVERY_INTERVAL:-3}"
 NETWORK_DISCOVERY_ELAPSED=0
 while [ -z "$PUBLIC_DOMAIN" ] || [ -z "$TCP_HOST" ] || [ -z "$TCP_PORT" ]; do
   if [ "$NETWORK_DISCOVERY_ELAPSED" -ge "$NETWORK_DISCOVERY_TIMEOUT" ]; then
-    [ -n "$PUBLIC_DOMAIN" ] || { echo "FATAL: RAILWAY_PUBLIC_DOMAIN unavailable; create Public Domain then Redeploy" >&2; exit 1; }
-    [ -n "$TCP_HOST" ] && [ -n "$TCP_PORT" ] || { echo "FATAL: Railway TCP Proxy unavailable; create TCP Proxy -> target 8080 then Redeploy" >&2; exit 1; }
+    [ -n "$PUBLIC_DOMAIN" ] || { echo "FATAL: RAILWAY_PUBLIC_DOMAIN unavailable" >&2; exit 1; }
+    [ -n "$TCP_HOST" ] && [ -n "$TCP_PORT" ] || { echo "FATAL: Railway TCP Proxy unavailable" >&2; exit 1; }
   fi
-  # The environment is authoritative for this process. Re-read it on each
-  # pass so a runtime environment provider that refreshes variables is handled.
   PUBLIC_DOMAIN="${RAILWAY_PUBLIC_DOMAIN:-$PUBLIC_DOMAIN}"
   TCP_HOST="${RAILWAY_TCP_PROXY_DOMAIN:-$TCP_HOST}"
   TCP_PORT="${RAILWAY_TCP_PROXY_PORT:-$TCP_PORT}"
@@ -68,7 +51,7 @@ echo "RAILWAY_NETWORK_DISCOVERY=READY elapsed=${NETWORK_DISCOVERY_ELAPSED}s"
 case "$TCP_PORT" in ''|*[!0-9]*) echo "FATAL: RAILWAY_TCP_PROXY_PORT must be numeric" >&2; exit 1;; esac
 [ "$TCP_PORT" -ge 1 ] && [ "$TCP_PORT" -le 65535 ] || { echo "FATAL: Railway TCP Proxy port out of range" >&2; exit 1; }
 
-# Current deployment networking wins over every persisted artifact.
+# Derived runtime artifacts are safe to replace; persisted identity files are never removed here.
 for f in "$D/runtime.json" "$D/state.json" "$D/manifest.json" "$D/runtime-manifest.json" "$D/subscription.txt" "$D/subscription.txt.tmp" "$D/subscription_url.txt" "${XRAY_CONFIG:-$D/config.json}"; do
   rm -f "$f"
 done
@@ -78,26 +61,51 @@ export RAILWAY_TCP_PROXY_TARGET_PORT=8080
 export RAILWAY_NETWORKING_SOURCE=current-deployment-environment
 export RAILWAY_NETWORKING_AUTHORITATIVE=true
 export RAILWAY_TCP_PROXY_DOMAIN="$TCP_HOST" RAILWAY_TCP_PROXY_PORT="$TCP_PORT" PUBLIC_DOMAIN="$PUBLIC_DOMAIN"
+
+# ================= IDENTITY BOUNDARY =================
+# This is the only place where node identity initialization is requested.
+# identity-init.py:
+#   - creates a complete identity set only on a never-initialized empty volume;
+#   - reuses the existing complete set on every later startup;
+#   - fails closed if an initialized volume is incomplete;
+#   - never replaces existing identity files.
+python3 /opt/xray/scripts/identity-init.py
+
 UUID_FILE="$D/uuid.txt"
-if [ -s "$UUID_FILE" ]; then
-  UUID="$(tr -d '[:space:]' <"$UUID_FILE")"
-  printf '%s' "$UUID" | grep -Eq '^[0-9a-fA-F-]{16,64}$' || { echo "FATAL: persisted UUID is invalid" >&2; exit 1; }
-else
-  UUID="$(xray uuid)"
-  write_secret "$UUID_FILE" "$UUID"
-fi
+[ -s "$UUID_FILE" ] || { echo "FATAL: persisted UUID missing after identity initialization" >&2; exit 1; }
+UUID="$(tr -d '[:space:]' <"$UUID_FILE")"
+printf '%s' "$UUID" | grep -Eq '^[0-9a-fA-F-]{16,64}$' || { echo "FATAL: persisted UUID is invalid" >&2; exit 1; }
+
 PRIV_FILE="$D/reality_private_key.txt"; PUB_FILE="$D/reality_public_key.txt"
-if [ -s "$PRIV_FILE" ] && [ -s "$PUB_FILE" ]; then
-  PRIVATE_KEY="$(tr -d '[:space:]' <"$PRIV_FILE")"; PUBLIC_KEY="$(tr -d '[:space:]' <"$PUB_FILE")"
-else
-  OUT="$(xray x25519 2>&1)"
-  PRIVATE_KEY="$(printf '%s\n' "$OUT" | awk -F': ' '/^PrivateKey/{print $2;exit}')"
-  PUBLIC_KEY="$(printf '%s\n' "$OUT" | awk -F': ' '/^Password/{print $2;exit}')"
-  [ -n "$PRIVATE_KEY" ] && [ -n "$PUBLIC_KEY" ] || { echo "FATAL: failed to generate REALITY keys" >&2; exit 1; }
-  write_secret "$PRIV_FILE" "$PRIVATE_KEY"; write_secret "$PUB_FILE" "$PUBLIC_KEY"
-fi
+[ -s "$PRIV_FILE" ] && [ -s "$PUB_FILE" ] || { echo "FATAL: persisted REALITY key files missing" >&2; exit 1; }
+PRIVATE_KEY="$(tr -d '[:space:]' <"$PRIV_FILE")"; PUBLIC_KEY="$(tr -d '[:space:]' <"$PUB_FILE")"
+[ -n "$PRIVATE_KEY" ] && [ -n "$PUBLIC_KEY" ] || { echo "FATAL: persisted REALITY key files are incomplete" >&2; exit 1; }
+
 TOKEN_FILE="$D/subscription_token.txt"
-if [ -s "$TOKEN_FILE" ]; then TOKEN="$(tr -d '[:space:]' <"$TOKEN_FILE")"; else TOKEN="$(python3 -c 'import secrets;print(secrets.token_urlsafe(32))')"; write_secret "$TOKEN_FILE" "$TOKEN"; fi
+[ -s "$TOKEN_FILE" ] || { echo "FATAL: persisted subscription token missing" >&2; exit 1; }
+TOKEN="$(tr -d '[:space:]' <"$TOKEN_FILE")"
+[ -n "$TOKEN" ] || { echo "FATAL: persisted subscription token is empty" >&2; exit 1; }
+
+IDS_FILE="$D/reality_short_ids.json"
+[ -s "$IDS_FILE" ] || { echo "FATAL: persisted REALITY short IDs missing" >&2; exit 1; }
+python3 - "$IDS_FILE" <<'PY_IDS'
+import json,sys
+from pathlib import Path
+p=Path(sys.argv[1])
+try:
+    obj=json.loads(p.read_text())
+except Exception as exc:
+    raise SystemExit(f"FATAL: persisted REALITY short IDs are invalid: {exc}")
+if not isinstance(obj,list) or len(obj) < 3:
+    raise SystemExit("FATAL: persisted REALITY short IDs are invalid")
+for item in obj:
+    s=str(item)
+    if not (2 <= len(s) <= 32):
+        raise SystemExit("FATAL: persisted REALITY short ID length invalid")
+print("PERSISTED_SHORT_IDS=PASS")
+PY_IDS
+
+echo "NODE_IDENTITY_POLICY=INITIALIZE_ONCE_REUSE_FOREVER"
 export UUID PRIVATE_KEY PUBLIC_KEY
 export REALITY_RAW_SNI="${REALITY_RAW_SNI:-www.cloudflare.com}" REALITY_RAW_TARGET="${REALITY_RAW_TARGET:-www.cloudflare.com:443}"
 export REALITY_FINGERPRINT="${REALITY_FINGERPRINT:-chrome}" REALITY_XHTTP_SNI="${REALITY_XHTTP_SNI:-www.apple.com}" REALITY_XHTTP_TARGET="${REALITY_XHTTP_TARGET:-www.apple.com:443}"
@@ -106,8 +114,6 @@ export GRPC_SERVICE_NAME="${GRPC_SERVICE_NAME:-grpc-service}" XHTTP_PATH="${XHTT
 CF_TOKEN="${CLOUDFLARE_TUNNEL_TOKEN:-${CF_TUNNEL_TOKEN:-${TUNNEL_TOKEN:-}}}"; CF_ID="${CLOUDFLARE_TUNNEL_ID:-${CF_TUNNEL_ID:-${TUNNEL_ID:-}}}"; CF_HOST="${CLOUDFLARE_PUBLIC_HOSTNAME:-${CF_PUBLIC_HOSTNAME:-}}"; CF_ORIGIN="${CLOUDFLARE_ORIGIN_SERVICE:-${CF_ORIGIN_SERVICE:-}}"; CF_PORT="${CLOUDFLARE_XHTTP_PORT:-${WS_PORT:-${CLOUDFLARE_WS_PORT:-${CF_WS_PORT:-}}}}"; CF_PATH="${CLOUDFLARE_XHTTP_PATH:-${WS_PATH:-${CLOUDFLARE_WS_PATH:-${CF_WS_PATH:-}}}}"
 export CLOUDFLARE_TUNNEL_TOKEN="$CF_TOKEN" CLOUDFLARE_TUNNEL_ID="$CF_ID" CLOUDFLARE_PUBLIC_HOSTNAME="$CF_HOST" CLOUDFLARE_ORIGIN_SERVICE="$CF_ORIGIN" CLOUDFLARE_XHTTP_PORT="$CF_PORT" CLOUDFLARE_XHTTP_PATH="$CF_PATH" WS_PORT="$CF_PORT" WS_PATH="$CF_PATH"
 
-# Initialize process handles before installing cleanup. The gateway is deliberately
-# started before runtime generation so Railway can pass its liveness probe immediately.
 XP=""; CFP=""
 cleanup(){ kill "$XP" "$GP" "$CFP" 2>/dev/null || true; wait "$XP" 2>/dev/null || true; wait "$GP" 2>/dev/null || true; wait "$CFP" 2>/dev/null || true; }
 trap cleanup INT TERM EXIT
@@ -116,7 +122,6 @@ kill -0 "$GP" 2>/dev/null || { echo "FATAL: gateway failed to bind 8080" >&2; ta
 echo "GATEWAY_BIND_EARLY=PASS port=8080"
 echo "HEALTH_ENDPOINT=PASS path=/health"
 
-# Bounded Railway TCP Proxy provisioning diagnostic. Informational only.
 TCP_HOST="${RAILWAY_TCP_PROXY_DOMAIN}"
 TCP_PORT="${RAILWAY_TCP_PROXY_PORT}"
 TCP_CHECK_SECONDS="${TCP_PROXY_CHECK_SECONDS:-20}"
@@ -124,7 +129,7 @@ TCP_CHECK_INTERVAL="${TCP_PROXY_CHECK_INTERVAL:-2}"
 TCP_PROXY_SETTLE_SECONDS="${TCP_PROXY_SETTLE_SECONDS:-30}"
 tcp_proxy_probe() {
   python3 - "$TCP_HOST" "$TCP_PORT" <<'PY2'
-import socket, sys
+import socket,sys
 host=sys.argv[1]; port=int(sys.argv[2])
 try: infos=socket.getaddrinfo(host,port,type=socket.SOCK_STREAM)
 except Exception: raise SystemExit(2)
@@ -169,9 +174,8 @@ echo "RAILWAY_CURRENT_PUBLIC=$PUBLIC_DOMAIN"
 echo "RAILWAY_CURRENT_TCP=$TCP_HOST:$TCP_PORT"
 echo "RAILWAY_TCP_PROXY_TARGET_PORT=8080"
 
-# Validate generated runtime before exposing readiness as healthy.
 python3 - "$RUNTIME" "$D/subscription.txt" <<'PY'
-import json,sys,re
+import json,sys
 from pathlib import Path
 r=json.loads(Path(sys.argv[1]).read_text()); lines=[x.strip() for x in Path(sys.argv[2]).read_text().splitlines() if x.strip()]
 expected=int(r.get('nodes',{}).get('count',0)); tcp=r.get('tcp_proxy',{}); public=r.get('public_domain','')
@@ -181,7 +185,6 @@ for i in (1,2,3): assert ('@%s:%s?'%(tcp.get('domain'),tcp.get('port'))) in line
 print('STARTUP_RUNTIME_INVARIANT=PASS nodes=%d tcp=%s:%s'%(expected,tcp.get('domain'),tcp.get('port')))
 PY
 
-# Start Xray only after 8080 is already listening.
 xray run -test -config "$XRAY_CONFIG"
 xray run -config "$XRAY_CONFIG" & XP=$!
 
@@ -219,6 +222,7 @@ if [ "$CF_ENABLED" = "1" ]; then wait_port 127.0.0.1 "$CF_PORT_STATE" cloudflare
 
 echo "========== DEPLOYMENT SUMMARY =========="
 echo "RELEASE=$BUILD_ID"
+echo "NODE_IDENTITY_POLICY=INITIALIZE_ONCE_REUSE_FOREVER"
 echo "RAILWAY_NETWORKING_SOURCE=current-deployment-environment"
 echo "RAILWAY_NETWORKING_AUTHORITATIVE=true"
 echo "RAILWAY_TCP_PROXY_TARGET_PORT=8080"
@@ -226,85 +230,10 @@ echo "GATEWAY_BIND_EARLY=PASS"
 echo "NODES=$(python3 -c 'import json;print(json.load(open("'"$RUNTIME"'"))["nodes"]["count"])')"
 echo "SUBSCRIPTION_CHECK=PASS"
 echo "XRAY=READY"
-if [ "$CF_ENABLED" = "1" ]; then echo "CLOUDFLARE=enabled"; echo "TRANSPORT=XHTTP_TLS"; else echo "CLOUDFLARE=disabled"; fi
-echo "GATEWAY=READY"
-echo "========================================="
-# Application readiness: all four local Xray listeners must be accepting
-# before the deployment is considered ready.
-for PORT in 10086 10087 10088 10089; do
-  READY=0
-  for _ in $(seq 1 30); do
-    if nc -z 127.0.0.1 "$PORT" 2>/dev/null; then
-      READY=1
-      break
-    fi
-    sleep 1
-  done
-  if [ "$READY" -ne 1 ]; then
-    echo "FATAL: Xray port $PORT did not become ready" >&2
-    exit 1
-  fi
-  echo "XRAY_PORT_READY=PASS port=$PORT"
-done
-echo "APPLICATION_READINESS=PASS"
-
-# Final operator-facing report. /health remains liveness; /ready is queried
-# only after all Xray listeners are confirmed ready.
-python3 - "$PUBLIC_DOMAIN" "$TOKEN" "$D" "$CF_ENABLED" "${CF_PORT_STATE:-}" <<'PY_REPORT'
-import socket
-import sys
-import urllib.request
-import json
-from pathlib import Path
-
-public, token, data_dir, cf_enabled, cf_port = sys.argv[1:]
-d = Path(data_dir)
-runtime = json.loads((d / "runtime.json").read_text())
-nodes = int(runtime.get("nodes", {}).get("count", 0) or 0)
-
-print("========== CLIENT ACCESS ==========")
-print(f"SUBSCRIPTION_URL=https://{public}/sub/{token}")
-print(f"SUBSCRIPTION_NODES={nodes}")
-
-ports = {1: 10086, 2: 10087, 3: 10088, 4: 10089}
-for n, port in ports.items():
-    try:
-        with socket.create_connection(("127.0.0.1", port), timeout=1.5):
-            print(f"NODE{n}=READY local_port={port}")
-    except OSError as exc:
-        print(f"NODE{n}=NOT_READY local_port={port} reason={type(exc).__name__}")
-
-if nodes == 5:
-    try:
-        p = int(cf_port)
-        with socket.create_connection(("127.0.0.1", p), timeout=1.5):
-            print(f"NODE5=READY local_port={p} transport=XHTTP_TLS_CLOUDFLARE")
-    except Exception as exc:
-        print(f"NODE5=NOT_READY local_port={cf_port} transport=XHTTP_TLS_CLOUDFLARE reason={type(exc).__name__}")
-
-try:
-    with urllib.request.urlopen("http://127.0.0.1:8080/ready", timeout=5) as r:
-        body = r.read().decode(errors="replace")
-        print(f"READY_ENDPOINT=HTTP_{r.status}")
-        print(f"READY_STATUS={body}")
-except Exception as exc:
-    print(f"READY_ENDPOINT=ERROR {type(exc).__name__}:{exc}")
-
-print("===================================")
-PY_REPORT
-
-echo "READY_ENDPOINT_EXPECTED=200"
-
-# Process supervision: if Gateway or Xray exits, terminate the container so
-# Railway restartPolicy can restart the whole service cleanly.
+if [ "$CF_ENABLED" = "1" ]; then echo "CLOUDFLARE=READY"; else echo "CLOUDFLARE=DISABLED"; fi
 while true; do
-  if ! kill -0 "$GP" 2>/dev/null; then
-    echo "FATAL: Gateway process exited; restarting container" >&2
-    exit 1
-  fi
-  if ! kill -0 "$XP" 2>/dev/null; then
-    echo "FATAL: Xray process exited; restarting container" >&2
-    exit 1
-  fi
+  if ! kill -0 "$GP" 2>/dev/null; then echo "FATAL: Gateway process exited; restarting container" >&2; exit 1; fi
+  if ! kill -0 "$XP" 2>/dev/null; then echo "FATAL: Xray process exited; restarting container" >&2; exit 1; fi
+  if [ "$CF_ENABLED" = "1" ] && ! kill -0 "$CFP" 2>/dev/null; then echo "FATAL: cloudflared process exited; restarting container" >&2; exit 1; fi
   sleep 2
 done

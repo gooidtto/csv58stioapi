@@ -1,9 +1,7 @@
 #!/bin/sh
 # Runtime self-healing supervisor.
 # It never changes Railway variables or node identity. If the existing
-# deployment becomes unhealthy, it terminates boot.sh and lets Railway's
-# ON_FAILURE policy restart the same deployment with the same persisted
-# UUID/REALITY keys/short IDs/subscription token.
+# deployment becomes unhealthy, it lets Railway restart the same service.
 set -eu
 
 D="${RAILWAY_VOLUME_MOUNT_PATH:-${DATA_DIR:-/data}}"
@@ -19,24 +17,14 @@ case "$FAILURES" in ''|*[!0-9]*) FAILURES=4;; esac
 [ "$CHECK_INTERVAL" -ge 2 ] || CHECK_INTERVAL=2
 [ "$FAILURES" -ge 2 ] || FAILURES=2
 
-log() {
-  printf '[supervisor] %s\n' "$*" | tee -a "$LOG"
-}
-
-cleanup() {
-  if [ -n "${BOOT_PID:-}" ]; then
-    kill -TERM "$BOOT_PID" 2>/dev/null || true
-  fi
-}
+log() { printf '[supervisor] %s\n' "$*" | tee -a "$LOG"; }
+cleanup() { if [ -n "${BOOT_PID:-}" ]; then kill -TERM "$BOOT_PID" 2>/dev/null || true; fi; }
 trap cleanup INT TERM EXIT
 
 log "START startup_grace=${STARTUP_GRACE}s interval=${CHECK_INTERVAL}s failures=${FAILURES}"
 /opt/xray/scripts/boot.sh >>"$LOG" 2>&1 &
 BOOT_PID=$!
 
-# Give the normal boot sequence enough time to discover Railway networking,
-# generate runtime state and start all local listeners. During this period the
-# supervisor only checks whether boot.sh is still alive.
 elapsed=0
 while [ "$elapsed" -lt "$STARTUP_GRACE" ]; do
   if ! kill -0 "$BOOT_PID" 2>/dev/null; then
@@ -50,11 +38,9 @@ done
 
 fail_count=0
 while kill -0 "$BOOT_PID" 2>/dev/null; do
-  # /ready validates the current runtime manifest, subscription endpoints,
-  # every Xray listener, and Cloudflare Tunnel readiness when Node 5 is enabled.
-  # It is intentionally read-only: the watchdog never regenerates node data.
+  # /ready is read-only and validates the current runtime/subscription state.
+  # It never regenerates or mutates node identity.
   if python3 - <<'PY'
-import sys
 import urllib.request
 try:
     with urllib.request.urlopen('http://127.0.0.1:8080/ready', timeout=4) as r:
@@ -63,9 +49,7 @@ except Exception:
     raise SystemExit(1)
 PY
   then
-    if [ "$fail_count" -gt 0 ]; then
-      log "READY_RECOVERED previous_failures=$fail_count"
-    fi
+    [ "$fail_count" -gt 0 ] && log "READY_RECOVERED previous_failures=$fail_count"
     fail_count=0
   else
     fail_count=$((fail_count + 1))

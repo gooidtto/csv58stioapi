@@ -3,7 +3,6 @@ import hashlib
 import json
 import os
 import re
-import secrets
 import urllib.parse
 from pathlib import Path
 
@@ -48,16 +47,16 @@ if CF_ENABLED:
     if CF_PORT in (8080,10086,10087,10088,10089): raise SystemExit("FATAL: CLOUDFLARE_XHTTP_PORT conflicts with internal port")
     if not re.fullmatch(r"[A-Za-z0-9.-]+", CF_HOST): raise SystemExit("FATAL: invalid Cloudflare hostname")
     if not CF_PATH.startswith("/"): raise SystemExit("FATAL: CLOUDFLARE_XHTTP_PATH must start with /")
-    # Cloudflare terminates the public HTTPS connection; cloudflared forwards HTTP to
-    # the local XHTTP origin. The tunnel therefore carries HTTP to this local port.
     CF_ORIGIN = f"http://127.0.0.1:{CF_PORT}"
 
+# Short IDs are part of node identity. They must already exist and be valid.
+# Generation is forbidden here; identity initialization belongs exclusively to identity-init.py.
 ids_file = D / "reality_short_ids.json"
-try: ids = json.loads(ids_file.read_text()) if ids_file.exists() else []
-except Exception: ids = []
-ids = [str(x) for x in ids if re.fullmatch(r"[0-9a-fA-F]{2,32}", str(x))]
-while len(ids) < 3: ids.append(secrets.token_hex(6))
-ids = ids[:3]; ids_file.write_text(json.dumps(ids, indent=2) + "\n")
+try: ids = json.loads(ids_file.read_text())
+except Exception as exc: raise SystemExit(f"FATAL: persisted REALITY short IDs are unreadable: {exc}")
+if not isinstance(ids, list) or len(ids) != 3 or any(not re.fullmatch(r"[0-9a-fA-F]{2,32}", str(x)) for x in ids):
+    raise SystemExit("FATAL: persisted REALITY short IDs are invalid")
+ids = [str(x) for x in ids]
 
 def reality(tag, port, network, sni, target, sid, flow="", service_name=""):
     client = {"id": UUID, "level": 0}
@@ -73,8 +72,6 @@ xhttp_reality = reality("vless-xhttp-reality", 10088, "xhttp", XHTTP_SNI, XHTTP_
 grpc_reality = reality("vless-grpc-reality", 10089, "grpc", GRPC_SNI, GRPC_TARGET, ids[2], service_name=GRPC_SERVICE_NAME)
 inbounds = [xhttp_tls, raw, xhttp_reality, grpc_reality]
 if CF_ENABLED:
-    # Node 5: VLESS + XHTTP behind Cloudflare Tunnel. Cloudflare terminates TLS
-    # at the public hostname and forwards HTTP to this local XHTTP origin.
     inbounds.append({"tag": "vless-xhttp-cloudflare", "listen": "127.0.0.1", "port": CF_PORT, "protocol": "vless", "settings": {"clients": [{"id": UUID, "level": 0}], "decryption": "none"}, "streamSettings": {"network": "xhttp", "security": "none", "xhttpSettings": {"path": CF_PATH, "mode": "auto"}}})
 config = {"log": {"loglevel": os.environ.get("XRAY_LOGLEVEL", "warning")}, "policy": {"levels": {"0": {"handshake": 8, "connIdle": 900, "uplinkOnly": 2, "downlinkOnly": 5}}}, "inbounds": inbounds, "outbounds": [{"tag": "direct", "protocol": "freedom"}, {"tag": "block", "protocol": "blackhole"}]}
 C.write_text(json.dumps(config, indent=2) + "\n")
@@ -90,13 +87,13 @@ if CF_ENABLED:
     lines.append(link(CF_HOST, 443, {"encryption":"none","security":"tls","sni":CF_HOST,"fp":FP,"alpn":"h2,http/1.1","type":"xhttp","host":CF_HOST,"path":CF_PATH,"mode":"auto"}, "VLESS XHTTP TLS · Cloudflare Tunnel"))
 NODE_COUNT = len(lines)
 if NODE_COUNT not in (4,5): raise SystemExit(f"FATAL: invalid node count: {NODE_COUNT}")
-prev = {}; rf = D / "runtime.json"
+BUILD_ID = os.environ.get("BUILD_ID", os.environ.get("RELEASE", "runtime-derived")).strip() or "runtime-derived"
+rf = D / "runtime.json"; prev = {}
 if rf.is_file():
     try: prev = json.loads(rf.read_text())
     except Exception: prev = {}
 pts = prev.get("tcp_proxy",{}) or {}; prev_public = str(prev.get("public_domain","")); prev_tcp = f"{pts.get('domain','')}:{pts.get('port','')}" if (pts.get("domain") or pts.get("port")) else ""; current_tcp = f"{TCP_HOST}:{TCP_PORT}"
 state = "initial" if not prev else ("unchanged" if prev_public == PUBLIC_DOMAIN and prev_tcp == current_tcp else "changed")
-BUILD_ID = os.environ.get("BUILD_ID", os.environ.get("RELEASE", "runtime-derived")).strip() or "runtime-derived"
 runtime = {"schema":26,"build":BUILD_ID,"architecture":"fixed-node-order-1-railway-xhttp-2-raw-reality-3-xhttp-reality-4-grpc-reality-5-cloudflare-xhttp-tls","cloudflare":{"enabled":CF_ENABLED,"transport":"xhttp","public_tls":True,"origin_protocol":"http","token_configured":bool(CF_TOKEN),"tunnel_id_configured":bool(CF_ID),"public_hostname":CF_HOST if CF_ENABLED else "","origin_service":CF_ORIGIN if CF_ENABLED else "","xhttp_port":CF_PORT if CF_ENABLED else None,"xhttp_path":CF_PATH if CF_ENABLED else ""},"nodes":{"count":NODE_COUNT,"distribution":{"01":"domain-xhttp-tls","02":"raw-reality-vision","03":"xhttp-reality","04":"grpc-reality",**({"05":"cloudflare-xhttp-tls"} if CF_ENABLED else {})}},"application_port":APP_PORT,"public_domain":PUBLIC_DOMAIN,"tcp_proxy":{"domain":TCP_HOST,"port":TCP_PORT,"application_port":APP_PORT},"railway_networking":{"source":"current-deployment-environment","authoritative":True,"state":state,"previous_public_domain":prev_public,"current_public_domain":PUBLIC_DOMAIN,"previous_tcp_proxy":prev_tcp,"current_tcp_proxy":current_tcp},"routes":{"domain_xhttp_tls":{"port":10086},"raw_reality_vision":{"sni":RAW_SNI,"port":10087,"short_id":ids[0]},"xhttp_reality":{"sni":XHTTP_SNI,"port":10088,"short_id":ids[1]},"grpc_reality":{"sni":GRPC_SNI,"port":10089,"short_id":ids[2],"service_name":GRPC_SERVICE_NAME},**({"cloudflare_xhttp_tls":{"host":CF_HOST,"port":CF_PORT,"path":CF_PATH,"origin":CF_ORIGIN}} if CF_ENABLED else {})}}
 runtime["fingerprint"] = hashlib.sha256(json.dumps(runtime, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
 (D/"runtime.json").write_text(json.dumps(runtime, indent=2)+"\n"); (D/"state.json").write_text(json.dumps(runtime, indent=2)+"\n"); (D/"subscription.txt.tmp").write_text("\n".join(lines)+"\n"); os.replace(D/"subscription.txt.tmp", D/"subscription.txt")
