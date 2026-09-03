@@ -170,12 +170,7 @@ def resolve_ids():
 
 
 def _normalize_domain_entries(raw):
-    """Normalize both observed Railway config-map shapes.
-
-    Depending on the Railway API/config revision, serviceDomains has been
-    observed as either {domainId: {domain: ...}} or {domain: {}}. The latter
-    has no deletion ID, so a second service-scoped query fills IDs in later.
-    """
+    """Normalize both observed Railway config-map shapes."""
     result = []
     if isinstance(raw, dict):
         for key, value in raw.items():
@@ -185,15 +180,20 @@ def _normalize_domain_entries(raw):
             if isinstance(value, dict):
                 domain = str(value.get("domain", "")).strip()
                 domain_id = key
+                config_key = key
                 if not domain and key.endswith(".up.railway.app"):
                     domain = key
                     domain_id = ""
                 if domain:
-                    result.append({"id": domain_id, "domain": domain})
+                    result.append({
+                        "id": domain_id,
+                        "domain": domain,
+                        "config_key": config_key,
+                    })
             elif isinstance(value, str):
                 domain = value.strip()
                 if domain:
-                    result.append({"id": key, "domain": domain})
+                    result.append({"id": key, "domain": domain, "config_key": key})
     elif isinstance(raw, list):
         for value in raw:
             if not isinstance(value, dict):
@@ -201,7 +201,7 @@ def _normalize_domain_entries(raw):
             domain = str(value.get("domain", "")).strip()
             domain_id = str(value.get("id", "")).strip()
             if domain:
-                result.append({"id": domain_id, "domain": domain})
+                result.append({"id": domain_id, "domain": domain, "config_key": domain_id})
     return result
 
 
@@ -212,9 +212,7 @@ def list_service_domains():
     Railway's current tooling. Some config revisions key serviceDomains by the
     domain string itself, so those entries have no deletion ID. In that case we
     cross-reference the service-scoped domains collection, which supplies the
-    stable IDs required by serviceDomainDelete. Most importantly, an empty or
-    differently-shaped config response is never allowed to trigger blind
-    creation if the service-scoped query proves a domain already exists.
+    stable IDs required by serviceDomainDelete.
     """
     data = gql(
         """query($id:String!){
@@ -235,9 +233,6 @@ def list_service_domains():
     networking = service_cfg.get("networking") or {}
     config_entries = _normalize_domain_entries(networking.get("serviceDomains") or {})
 
-    # Cross-check with Railway's service-scoped domain collection. This is
-    # essential when config uses {domain:{}} entries or when the dashboard has
-    # retained a domain that the config snapshot does not fully materialize.
     service_data = gql(
         """query($id:String!){
              service(id:$id){
@@ -256,11 +251,8 @@ def list_service_domains():
         domain = str(value.get("domain", "")).strip()
         domain_id = str(value.get("id", "")).strip()
         if domain:
-            service_entries.append({"id": domain_id, "domain": domain})
+            service_entries.append({"id": domain_id, "domain": domain, "config_key": ""})
 
-    # Prefer the service-scoped collection when it contains entries. Merge in
-    # any config-only names so a dashboard-visible duplicate is not silently
-    # discarded if the two API projections are temporarily inconsistent.
     merged = {entry["domain"]: entry for entry in service_entries}
     for entry in config_entries:
         existing = merged.get(entry["domain"])
@@ -268,23 +260,52 @@ def list_service_domains():
             merged[entry["domain"]] = entry
         elif not existing.get("id") and entry.get("id"):
             existing["id"] = entry["id"]
+        if existing is not None and entry.get("config_key"):
+            existing["config_key"] = entry["config_key"]
 
     return list(merged.values())
 
 
-def delete_service_domain(domain_id, domain):
-    if not domain_id:
+def delete_service_domain(domain_id, domain, config_key=""):
+    print(f"RAILWAY_API_ACTION=DELETE_DUPLICATE_PUBLIC_DOMAIN domain={domain}")
+    if domain_id:
+        gql(
+            """mutation($id:String!){
+                 serviceDomainDelete(id:$id)
+               }""",
+            {"id": domain_id},
+        )
+    elif config_key:
+        # Some Railway config snapshots key serviceDomains by the domain name
+        # itself and expose no UUID. Use the supported environment patch path
+        # instead of attempting another create (which can hit the plan limit).
+        gql(
+            """mutation($environmentId:String!,$patch:EnvironmentConfig,$commitMessage:String){
+                 environmentPatchCommit(
+                   environmentId:$environmentId,
+                   patch:$patch,
+                   commitMessage:$commitMessage
+                 )
+               }""",
+            {
+                "environmentId": ENVIRONMENT_ID,
+                "patch": {
+                    "services": {
+                        SERVICE_ID: {
+                            "networking": {
+                                "serviceDomains": {config_key: None}
+                            }
+                        }
+                    }
+                },
+                "commitMessage": "Remove duplicate Railway service domain",
+            },
+        )
+    else:
         raise ApiError(
-            f"Railway duplicate domain has no deletion ID: {domain}; "
+            f"Railway duplicate domain has no deletion ID or config key: {domain}; "
             "refusing to create another domain"
         )
-    print(f"RAILWAY_API_ACTION=DELETE_DUPLICATE_PUBLIC_DOMAIN domain={domain}")
-    gql(
-        """mutation($id:String!){
-             serviceDomainDelete(id:$id)
-           }""",
-        {"id": domain_id},
-    )
     print(f"RAILWAY_API_PUBLIC_DOMAIN=DELETED domain={domain}")
 
 
@@ -338,6 +359,7 @@ def setup():
             delete_service_domain(
                 str(domain.get("id", "")).strip(),
                 str(domain.get("domain", "")).strip(),
+                str(domain.get("config_key", "")).strip(),
             )
             changed = True
         print(f"RAILWAY_API_PUBLIC_DOMAIN=RECONCILED count=1 keep={keep_domain}")
