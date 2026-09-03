@@ -30,7 +30,7 @@ RUN set -eu; \
     check tcp_proxy_target grep -q 'tcp_proxy_expected_target":8080' /opt/xray/scripts/runtime-manifest.py; \
     check boot_identity_init grep -q 'identity-init.py' /opt/xray/scripts/boot.sh; \
     check identity_policy grep -q 'NODE_IDENTITY_POLICY=INITIALIZE_ONCE_REUSE_FOREVER' /opt/xray/scripts/boot.sh; \
-    check identity_reuse grep -q 'NODE_IDENTITY=REUSED' /opt/xray/scripts/identity-init.py; \
+    check identity_reuse grep -q 'emit_identity_status("REUSED")' /opt/xray/scripts/identity-init.py; \
     check identity_fail_closed grep -q 'refusing to rotate identity' /opt/xray/scripts/identity-init.py; \
     check short_ids_immutable grep -q 'Short IDs are part of node identity' /opt/xray/scripts/generate.py; \
     check gateway_early grep -q 'GATEWAY_BIND_EARLY=PASS' /opt/xray/scripts/boot.sh; \
