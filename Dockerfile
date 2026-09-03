@@ -30,7 +30,7 @@ RUN python3 -m py_compile /opt/xray/scripts/*.py && \
     grep -q 'application/json' /opt/xray/scripts/gateway.py && \
     grep -q 'CLOUDFLARED_READY=PASS' /opt/xray/scripts/boot.sh && \
     grep -q 'READY_UNHEALTHY' /opt/xray/scripts/supervise.sh && \
-    grep -q 'same persisted' /opt/xray/scripts/supervise.sh && \
+    grep -q 'never changes Railway variables or node identity' /opt/xray/scripts/supervise.sh && \
     ! grep -q 'cloudflare-ws-tls' /opt/xray/scripts/generate.py && \
     ! grep -q 'type":"ws"' /opt/xray/scripts/generate.py && \
     ! grep -q 'secrets.token_' /opt/xray/scripts/generate.py && \
