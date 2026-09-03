@@ -3,8 +3,8 @@
 
 Identity is a persistent, immutable deployment primitive. A brand-new empty
 volume may be initialized once. Once the marker exists, the complete identity
-must remain present and valid; otherwise startup fails closed and no identity
-is regenerated.
+must remain present and match its integrity seal; otherwise startup fails closed
+and no identity is regenerated.
 """
 import hashlib
 import json
@@ -21,6 +21,7 @@ PRIV_FILE = D / "reality_private_key.txt"
 PUB_FILE = D / "reality_public_key.txt"
 TOKEN_FILE = D / "subscription_token.txt"
 IDS_FILE = D / "reality_short_ids.json"
+SEAL_FILE = D / "identity-integrity.json"
 MARKER = D / ".node-identity-initialized"
 
 IDENTITY_FILES = (UUID_FILE, PRIV_FILE, PUB_FILE, TOKEN_FILE, IDS_FILE)
@@ -30,12 +31,7 @@ SHORT_ID_RE = re.compile(r"^[0-9a-fA-F]{2,32}$")
 
 
 def persistent_mount_present(path: Path) -> bool:
-    """Require the identity directory to be an actual mount point.
-
-    A Railway Volume must be mounted here before identity is ever initialized.
-    Checking /proc/self/mountinfo avoids relying on the optional `mountpoint`
-    utility, which is not installed in the Alpine runtime image.
-    """
+    """Require the identity directory to be an actual mount point."""
     try:
         target = str(path.resolve())
         if target == "/":
@@ -114,6 +110,38 @@ def identity_complete() -> bool:
     return all(isinstance(x, str) and SHORT_ID_RE.fullmatch(x) for x in ids)
 
 
+def file_sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as fh:
+        for chunk in iter(lambda: fh.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def build_seal() -> dict:
+    return {
+        "schema": 1,
+        "files": {path.name: file_sha256(path) for path in IDENTITY_FILES},
+    }
+
+
+def write_seal() -> None:
+    atomic_write(SEAL_FILE, json.dumps(build_seal(), sort_keys=True, separators=(",", ":")))
+
+
+def seal_valid() -> bool:
+    raw = read_nonempty(SEAL_FILE)
+    if not raw:
+        return False
+    try:
+        obj = json.loads(raw)
+        if obj.get("schema") != 1 or obj.get("files") != build_seal()["files"]:
+            return False
+        return True
+    except Exception:
+        return False
+
+
 def identity_fingerprint() -> str:
     """Return a non-secret stable fingerprint for deployment log verification."""
     uuid = read_nonempty(UUID_FILE)
@@ -152,9 +180,8 @@ def generate_identity() -> None:
     token = secrets.token_urlsafe(32)
     ids = [secrets.token_hex(6) for _ in range(3)]
 
-    # Every individual file is atomically replaced and fsynced. The marker is
-    # written last, so an interrupted first initialization can never be mistaken
-    # for a successfully initialized identity. Any incomplete set is fail-closed.
+    # Identity files are written atomically and fsynced. The integrity seal is
+    # written before the marker, so the marker can only mean a complete sealed set.
     atomic_write(UUID_FILE, uuid)
     atomic_write(PRIV_FILE, private)
     atomic_write(PUB_FILE, public)
@@ -178,15 +205,26 @@ def main() -> None:
                 "FATAL: node identity was previously initialized but is missing or invalid; "
                 "refusing to rotate identity"
             )
-        emit_identity_status("REUSED")
+        if SEAL_FILE.exists():
+            if not seal_valid():
+                raise SystemExit(
+                    "FATAL: node identity integrity seal mismatch; refusing to rotate identity"
+                )
+            emit_identity_status("REUSED")
+            return
+        # One-time seal migration for the identity created by the previous
+        # identity-init revision. No identity value is changed or regenerated.
+        write_seal()
+        emit_identity_status("REUSED_SEALED")
         return
 
     if complete:
+        write_seal()
         write_marker()
         emit_identity_status("REUSED_INITIALIZED")
         return
 
-    if any(p.exists() for p in IDENTITY_FILES):
+    if any(p.exists() for p in IDENTITY_FILES) or SEAL_FILE.exists():
         raise SystemExit(
             "FATAL: partial or invalid node identity found on an uninitialized volume; "
             "refusing to mix, repair, or replace identity"
@@ -195,6 +233,7 @@ def main() -> None:
     generate_identity()
     if not identity_complete():
         raise SystemExit("FATAL: node identity initialization did not produce a complete identity set")
+    write_seal()
     write_marker()
     emit_identity_status("INITIALIZED")
 
