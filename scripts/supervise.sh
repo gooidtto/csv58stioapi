@@ -18,13 +18,18 @@ case "$FAILURES" in ''|*[!0-9]*) FAILURES=4;; esac
 [ "$FAILURES" -ge 2 ] || FAILURES=2
 
 log() { printf '[supervisor] %s\n' "$*" | tee -a "$LOG"; }
-cleanup() { if [ -n "${BOOT_PID:-}" ]; then kill -TERM "$BOOT_PID" 2>/dev/null || true; fi; }
+cleanup() {
+  if [ -n "${TAIL_PID:-}" ]; then kill -TERM "$TAIL_PID" 2>/dev/null || true; fi
+  if [ -n "${BOOT_PID:-}" ]; then kill -TERM "$BOOT_PID" 2>/dev/null || true; fi
+}
 trap cleanup INT TERM EXIT
 
 start_boot() {
-  # Mirror boot output to Railway logs as well as the persistent diagnostic log.
-  /opt/xray/scripts/boot.sh 2>&1 | tee -a "$LOG" &
+  # Preserve boot.sh's real exit code while mirroring its output to Railway logs.
+  /opt/xray/scripts/boot.sh >>"$LOG" 2>&1 &
   BOOT_PID=$!
+  tail -n 0 -f "$LOG" 2>/dev/null &
+  TAIL_PID=$!
   log "BOOT_STARTED pid=$BOOT_PID"
 }
 
@@ -46,6 +51,8 @@ while [ "$elapsed" -lt "$STARTUP_GRACE" ]; do
     set -e
     if [ "$BOOT_RC" -eq 10 ]; then
       log "BOOT_REQUESTED_RAILWAY_REDEPLOY rc=10 restarting_boot=true"
+      kill -TERM "$TAIL_PID" 2>/dev/null || true
+      wait "$TAIL_PID" 2>/dev/null || true
       start_boot
       elapsed=0
       continue
