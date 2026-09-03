@@ -1,9 +1,11 @@
 #!/usr/bin/env python3
 """Idempotent Railway networking bootstrap.
 
-The script reconciles runtime networking only. It never creates or changes node
-identity. Railway-provided service domains are kept at exactly one, and the TCP
-proxy target is validated before runtime artifacts are generated.
+This module owns runtime networking only:
+  Railway service domain -> HTTP/TLS gateway on :8080
+  Railway TCP proxy -> TCP gateway on :8080
+
+It never creates, rotates, repairs, or otherwise changes node identity.
 """
 import json
 import os
@@ -153,13 +155,7 @@ def _normalize_domain_entries(raw):
 
 
 def list_service_domains():
-    """Read all Railway-provided domains from the environment configuration.
-
-    Do not query Service.domains here: the current Railway GraphQL schema used by
-    this deployment does not expose that field. The environment config is the
-    authoritative configuration snapshot and also exposes the map keys needed
-    for environmentPatchCommit when a domain UUID is not present.
-    """
+    """Read Railway-provided domains from the environment configuration."""
     data = gql(
         """query($id:String!){ environment(id:$id){ config(decryptVariables:false) } }""",
         {"id": ENVIRONMENT_ID},
@@ -182,10 +178,7 @@ def list_service_domains():
 def delete_service_domain(domain_id, domain, config_key=""):
     print(f"RAILWAY_API_ACTION=DELETE_DUPLICATE_PUBLIC_DOMAIN domain={domain}")
     if domain_id:
-        gql(
-            """mutation($id:String!){ serviceDomainDelete(id:$id) }""",
-            {"id": domain_id},
-        )
+        gql("""mutation($id:String!){ serviceDomainDelete(id:$id) }""", {"id": domain_id})
     elif config_key:
         gql(
             """mutation($environmentId:String!,$patch:EnvironmentConfig,$commitMessage:String){
@@ -193,13 +186,7 @@ def delete_service_domain(domain_id, domain, config_key=""):
                }""",
             {
                 "environmentId": ENVIRONMENT_ID,
-                "patch": {
-                    "services": {
-                        SERVICE_ID: {
-                            "networking": {"serviceDomains": {config_key: None}}
-                        }
-                    }
-                },
+                "patch": {"services": {SERVICE_ID: {"networking": {"serviceDomains": {config_key: None}}}}},
                 "commitMessage": "Remove duplicate Railway service domain",
             },
         )
@@ -220,15 +207,9 @@ def create_service_domain():
     print(f"RAILWAY_API_PUBLIC_DOMAIN=CREATED domain={domain}")
 
 
-def ensure_tcp_proxy():
-    proxies = gql(
-        """query($serviceId:String!,$environmentId:String!){
-             tcpProxies(serviceId:$serviceId,environmentId:$environmentId){id domain proxyPort applicationPort}
-           }""",
-        {"serviceId": SERVICE_ID, "environmentId": ENVIRONMENT_ID},
-    ).get("tcpProxies") or []
-    normalized = []
-    for proxy in proxies:
+def _normalize_tcp_proxies(raw):
+    result = []
+    for proxy in raw or []:
         if not isinstance(proxy, dict):
             continue
         try:
@@ -237,26 +218,60 @@ def ensure_tcp_proxy():
         except (TypeError, ValueError):
             application_port = -1
             proxy_port = -1
-        normalized.append({
-            "id": str(proxy.get("id", "")),
-            "domain": str(proxy.get("domain", "")),
+        result.append({
+            "id": str(proxy.get("id", "")).strip(),
+            "domain": str(proxy.get("domain", "")).strip(),
             "proxyPort": proxy_port,
             "applicationPort": application_port,
         })
+    return result
+
+
+def delete_tcp_proxy(proxy):
+    proxy_id = proxy.get("id", "")
+    if not proxy_id:
+        raise ApiError("Railway TCP proxy has no deletion id")
+    print(f"RAILWAY_API_ACTION=DELETE_DUPLICATE_TCP_PROXY domain={proxy.get('domain','')} port={proxy.get('proxyPort','')}")
+    gql("""mutation($id:String!){ tcpProxyDelete(id:$id) }""", {"id": proxy_id})
+    print(f"RAILWAY_API_TCP_PROXY=DELETED id={proxy_id}")
+
+
+def ensure_tcp_proxy():
+    raw = gql(
+        """query($serviceId:String!,$environmentId:String!){
+             tcpProxies(serviceId:$serviceId,environmentId:$environmentId){id domain proxyPort applicationPort}
+           }""",
+        {"serviceId": SERVICE_ID, "environmentId": ENVIRONMENT_ID},
+    ).get("tcpProxies") or []
+    normalized = _normalize_tcp_proxies(raw)
     target = [p for p in normalized if p["applicationPort"] == TARGET_PORT]
     print(f"RAILWAY_API_TCP_PROXY_CONFIG_COUNT={len(normalized)}")
     if normalized:
         print("RAILWAY_API_TCP_PROXY_CONFIG=" + ",".join(
             f"{p['domain']}:{p['proxyPort']}->{p['applicationPort']}" for p in normalized
         ))
+
     if len(target) > 1:
-        raise ApiError("multiple Railway TCP proxies target application port 8080; refusing ambiguous runtime endpoint")
-    if target:
+        keep = next((p for p in target if p["domain"] == os.environ.get("RAILWAY_TCP_PROXY_DOMAIN", "").strip()), target[0])
+        print(f"RAILWAY_API_TCP_PROXY=DUPLICATES count={len(target)} keep={keep['domain']}:{keep['proxyPort']}")
+        for proxy in target:
+            if proxy is keep:
+                continue
+            delete_tcp_proxy(proxy)
+        print("RAILWAY_API_TCP_PROXY=RECONCILED target=8080 count=1")
+        return True
+
+    if len(target) == 1:
         proxy = target[0]
         if not proxy["domain"] or not (1 <= proxy["proxyPort"] <= 65535):
             raise ApiError("Railway TCP proxy targeting 8080 has invalid domain or proxy port")
-        print("RAILWAY_API_TCP_PROXY=EXISTS target=8080")
+        print(f"RAILWAY_API_TCP_PROXY=EXISTS target=8080 domain={proxy['domain']} port={proxy['proxyPort']}")
+        env_host = os.environ.get("RAILWAY_TCP_PROXY_DOMAIN", "").strip()
+        env_port = os.environ.get("RAILWAY_TCP_PROXY_PORT", "").strip()
+        if env_host and env_port and (env_host != proxy["domain"] or env_port != str(proxy["proxyPort"])):
+            print(f"RAILWAY_API_TCP_PROXY_ENV_MISMATCH env={env_host}:{env_port} config={proxy['domain']}:{proxy['proxyPort']}")
         return False
+
     print("RAILWAY_API_ACTION=CREATE_TCP_PROXY target=8080")
     result = gql(
         """mutation($input:TCPProxyCreateInput!){ tcpProxyCreate(input:$input){id domain proxyPort applicationPort} }""",
@@ -289,9 +304,7 @@ def setup():
         if current_domain and current_domain != configured:
             print(f"RAILWAY_API_PUBLIC_DOMAIN_ENV_MISMATCH env={current_domain} config={configured}")
     else:
-        keep = next((d for d in service_domains if d["domain"] == current_domain), None)
-        if keep is None:
-            keep = service_domains[0]
+        keep = next((d for d in service_domains if d["domain"] == current_domain), service_domains[0])
         print(f"RAILWAY_API_PUBLIC_DOMAIN=DUPLICATES count={len(service_domains)} keep={keep['domain']}")
         for domain in service_domains:
             if domain is keep:
