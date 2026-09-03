@@ -169,15 +169,52 @@ def resolve_ids():
             raise ApiError("unable to identify target Railway service")
 
 
-def list_service_domains():
-    """Return Railway-provided service domains with stable config-map IDs.
+def _normalize_domain_entries(raw):
+    """Normalize both observed Railway config-map shapes.
 
-    Railway's current public API documentation exposes all domains through
-    environment.config(). The serviceDomains map is keyed by domain ID, which
-    is exactly what serviceDomainDelete requires. Using this config snapshot
-    also matches the structure shown by the Railway dashboard/CLI and avoids
-    relying on a separate domains resolver that may return only the currently
-    selected/canonical service domain.
+    Depending on the Railway API/config revision, serviceDomains has been
+    observed as either {domainId: {domain: ...}} or {domain: {}}. The latter
+    has no deletion ID, so a second service-scoped query fills IDs in later.
+    """
+    result = []
+    if isinstance(raw, dict):
+        for key, value in raw.items():
+            key = str(key).strip()
+            if not key:
+                continue
+            if isinstance(value, dict):
+                domain = str(value.get("domain", "")).strip()
+                domain_id = key
+                if not domain and key.endswith(".up.railway.app"):
+                    domain = key
+                    domain_id = ""
+                if domain:
+                    result.append({"id": domain_id, "domain": domain})
+            elif isinstance(value, str):
+                domain = value.strip()
+                if domain:
+                    result.append({"id": key, "domain": domain})
+    elif isinstance(raw, list):
+        for value in raw:
+            if not isinstance(value, dict):
+                continue
+            domain = str(value.get("domain", "")).strip()
+            domain_id = str(value.get("id", "")).strip()
+            if domain:
+                result.append({"id": domain_id, "domain": domain})
+    return result
+
+
+def list_service_domains():
+    """Return all Railway-provided service domains, including deletion IDs.
+
+    First read environment.config(), which is the configuration source used by
+    Railway's current tooling. Some config revisions key serviceDomains by the
+    domain string itself, so those entries have no deletion ID. In that case we
+    cross-reference the service-scoped domains collection, which supplies the
+    stable IDs required by serviceDomainDelete. Most importantly, an empty or
+    differently-shaped config response is never allowed to trigger blind
+    creation if the service-scoped query proves a domain already exists.
     """
     data = gql(
         """query($id:String!){
@@ -196,31 +233,51 @@ def list_service_domains():
 
     service_cfg = ((config.get("services") or {}).get(SERVICE_ID)) or {}
     networking = service_cfg.get("networking") or {}
-    raw = networking.get("serviceDomains") or {}
+    config_entries = _normalize_domain_entries(networking.get("serviceDomains") or {})
 
-    result = []
-    if isinstance(raw, dict):
-        for domain_id, value in raw.items():
-            if not isinstance(value, dict):
-                continue
-            domain = str(value.get("domain", "")).strip()
-            if domain:
-                result.append({"id": str(domain_id).strip(), "domain": domain})
-    elif isinstance(raw, list):
-        for value in raw:
-            if not isinstance(value, dict):
-                continue
-            domain = str(value.get("domain", "")).strip()
-            domain_id = str(value.get("id", "")).strip()
-            if domain:
-                result.append({"id": domain_id, "domain": domain})
+    # Cross-check with Railway's service-scoped domain collection. This is
+    # essential when config uses {domain:{}} entries or when the dashboard has
+    # retained a domain that the config snapshot does not fully materialize.
+    service_data = gql(
+        """query($id:String!){
+             service(id:$id){
+               domains{
+                 serviceDomains{ id domain suffix }
+               }
+             }
+           }""",
+        {"id": SERVICE_ID},
+    )
+    service_domains = (((service_data.get("service") or {}).get("domains") or {}).get("serviceDomains") or [])
+    service_entries = []
+    for value in service_domains:
+        if not isinstance(value, dict):
+            continue
+        domain = str(value.get("domain", "")).strip()
+        domain_id = str(value.get("id", "")).strip()
+        if domain:
+            service_entries.append({"id": domain_id, "domain": domain})
 
-    return result
+    # Prefer the service-scoped collection when it contains entries. Merge in
+    # any config-only names so a dashboard-visible duplicate is not silently
+    # discarded if the two API projections are temporarily inconsistent.
+    merged = {entry["domain"]: entry for entry in service_entries}
+    for entry in config_entries:
+        existing = merged.get(entry["domain"])
+        if existing is None:
+            merged[entry["domain"]] = entry
+        elif not existing.get("id") and entry.get("id"):
+            existing["id"] = entry["id"]
+
+    return list(merged.values())
 
 
 def delete_service_domain(domain_id, domain):
     if not domain_id:
-        raise ApiError(f"Railway service domain has no ID: {domain}")
+        raise ApiError(
+            f"Railway duplicate domain has no deletion ID: {domain}; "
+            "refusing to create another domain"
+        )
     print(f"RAILWAY_API_ACTION=DELETE_DUPLICATE_PUBLIC_DOMAIN domain={domain}")
     gql(
         """mutation($id:String!){
