@@ -13,11 +13,12 @@ COPY --from=cloudflared /usr/local/bin/cloudflared /usr/local/bin/cloudflared
 COPY scripts/ /opt/xray/scripts/
 COPY config/ /opt/xray/config/
 COPY site/ /opt/xray/site/
-# Build-time invariants: keep each check independently diagnosable.
+# Build-time invariants: runtime artifacts are derived, while node identity is initialized once and reused forever.
 RUN set -eu; \
     check() { label="$1"; shift; if "$@"; then echo "BUILD_CHECK ${label}=PASS"; else echo "BUILD_CHECK ${label}=FAIL" >&2; exit 1; fi; }; \
     check py_compile python3 -m py_compile /opt/xray/scripts/*.py; \
-    check identity_init_executable test -x /opt/xray/scripts/identity-init.py; \
+    check identity_init_present test -f /opt/xray/scripts/identity-init.py; \
+    check identity_init_executable sh -c 'test "$(stat -c "%a" /opt/xray/scripts/identity-init.py)" = 755'; \
     check cloudflare_generator grep -q 'vless-xhttp-cloudflare' /opt/xray/scripts/generate.py; \
     check xhttp_network grep -q 'type":"xhttp"' /opt/xray/scripts/generate.py; \
     check cloudflare_xhttp_tls grep -q 'cloudflare-xhttp-tls' /opt/xray/scripts/generate.py; \
