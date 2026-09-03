@@ -91,10 +91,17 @@ def generate_identity() -> None:
     raw = subprocess.check_output(["xray", "x25519"], text=True, stderr=subprocess.STDOUT)
     private = public = ""
     for line in raw.splitlines():
-        if line.startswith("PrivateKey: "):
-            private = line.split(": ", 1)[1].strip()
-        elif line.startswith("Password: "):
-            public = line.split(": ", 1)[1].strip()
+        line = line.strip()
+        if line.startswith("PrivateKey:"):
+            private = line.split(":", 1)[1].strip()
+        elif line.startswith("Password (PublicKey):"):
+            public = line.split(":", 1)[1].strip()
+        elif line.startswith("Password:"):
+            # Compatibility with Xray builds that omit the parenthetical label.
+            public = line.split(":", 1)[1].strip()
+        elif line.startswith("PublicKey:"):
+            # Compatibility with older Xray output.
+            public = line.split(":", 1)[1].strip()
     if not REALITY_KEY_RE.fullmatch(private) or not REALITY_KEY_RE.fullmatch(public):
         raise RuntimeError("xray generated an invalid REALITY key pair")
 
