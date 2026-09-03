@@ -21,15 +21,35 @@ log() { printf '[supervisor] %s\n' "$*" | tee -a "$LOG"; }
 cleanup() { if [ -n "${BOOT_PID:-}" ]; then kill -TERM "$BOOT_PID" 2>/dev/null || true; fi; }
 trap cleanup INT TERM EXIT
 
-log "START startup_grace=${STARTUP_GRACE}s interval=${CHECK_INTERVAL}s failures=${FAILURES}"
-/opt/xray/scripts/boot.sh >>"$LOG" 2>&1 &
-BOOT_PID=$!
+start_boot() {
+  /opt/xray/scripts/boot.sh >>"$LOG" 2>&1 &
+  BOOT_PID=$!
+  log "BOOT_STARTED pid=$BOOT_PID"
+}
 
+log "START startup_grace=${STARTUP_GRACE}s interval=${CHECK_INTERVAL}s failures=${FAILURES}"
+start_boot
+
+# railway_setup.py intentionally uses exit code 10 to signal that it created
+# missing Railway networking and requested a redeploy. boot.sh currently runs
+# with `set -e`, so that code can propagate before its explicit rc handling.
+# Treat only rc=10 as the expected bootstrap handoff; real failures remain
+# fail-closed. The restarted boot sees the newly-created networking state and
+# then continues through identity initialization and Xray startup.
 elapsed=0
 while [ "$elapsed" -lt "$STARTUP_GRACE" ]; do
   if ! kill -0 "$BOOT_PID" 2>/dev/null; then
-    wait "$BOOT_PID" 2>/dev/null || true
-    log "BOOT_EXITED_DURING_STARTUP"
+    set +e
+    wait "$BOOT_PID"
+    BOOT_RC=$?
+    set -e
+    if [ "$BOOT_RC" -eq 10 ]; then
+      log "BOOT_REQUESTED_RAILWAY_REDEPLOY rc=10 restarting_boot=true"
+      start_boot
+      elapsed=0
+      continue
+    fi
+    log "BOOT_EXITED_DURING_STARTUP rc=${BOOT_RC}"
     exit 1
   fi
   sleep "$CHECK_INTERVAL"
@@ -66,6 +86,9 @@ PY
   sleep "$CHECK_INTERVAL"
 done
 
-wait "$BOOT_PID" 2>/dev/null || true
-log "BOOT_EXITED restarting_container=true"
+set +e
+wait "$BOOT_PID"
+BOOT_RC=$?
+set -e
+log "BOOT_EXITED restarting_container=true rc=${BOOT_RC}"
 exit 1
