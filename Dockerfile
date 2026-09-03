@@ -30,6 +30,7 @@ RUN set -eu; \
     check persistent_volume_guard grep -q 'not a mounted persistent volume' /opt/xray/scripts/identity-init.py; \
     check identity_reuse grep -q 'emit_identity_status("REUSED")' /opt/xray/scripts/identity-init.py; \
     check identity_fail_closed grep -q 'refusing to rotate identity' /opt/xray/scripts/identity-init.py; \
+    check identity_integrity_seal grep -q 'identity-integrity.json' /opt/xray/scripts/identity-init.py; \
     check boot_identity_init grep -q 'identity-init.py' /opt/xray/scripts/boot.sh; \
     check identity_policy grep -q 'NODE_IDENTITY_POLICY=INITIALIZE_ONCE_REUSE_FOREVER' /opt/xray/scripts/boot.sh; \
     check short_ids_immutable grep -q 'Short IDs are part of node identity' /opt/xray/scripts/generate.py; \
