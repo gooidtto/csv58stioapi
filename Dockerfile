@@ -23,6 +23,7 @@ RUN set -eu; \
     check xray_digest_pinned sh -c 'test "${XRAY_IMAGE_DIGEST}" = "sha256:592ec4d11f656db95598d01e76dbcc6e002d67360b96a5436500a938230f52c7"'; \
     check py_compile python3 -m py_compile /opt/xray/scripts/*.py; \
     check identity_init_present test -f /opt/xray/scripts/identity-init.py; \
+    check persistent_volume_guard grep -q 'not a mounted persistent volume' /opt/xray/scripts/identity-init.py; \
     check cloudflare_generator grep -q 'vless-xhttp-cloudflare' /opt/xray/scripts/generate.py; \
     check xhttp_network grep -q 'type":"xhttp"' /opt/xray/scripts/generate.py; \
     check cloudflare_xhttp_tls grep -q 'cloudflare-xhttp-tls' /opt/xray/scripts/generate.py; \
