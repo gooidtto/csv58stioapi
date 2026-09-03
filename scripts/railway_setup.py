@@ -77,8 +77,6 @@ def _request_once(query, variables, mode):
         raise ApiError(f"request failed: {exc}")
 
     if body.get("errors"):
-        # GraphQL errors are normally semantic/auth/schema errors. Do not
-        # blindly repeat mutations on these responses.
         raise ApiError(json.dumps(body["errors"], ensure_ascii=False)[:1200])
     return body.get("data") or {}
 
@@ -108,9 +106,6 @@ def gql(query, variables=None):
     if AUTH_MODE:
         return _request(query, variables or {}, AUTH_MODE)
 
-    # A real Project Token is documented to use Project-Access-Token.
-    # Workspace/Account tokens may be stored by users under RAILWAY_TOKEN;
-    # detect that case without requiring projectToken discovery first.
     if PROJECT_TOKEN:
         try:
             data = _request(query, variables or {}, "project")
@@ -175,25 +170,52 @@ def resolve_ids():
 
 
 def list_service_domains():
-    """Return authoritative Railway-provided service domains with IDs."""
+    """Return Railway-provided service domains with stable config-map IDs.
+
+    Railway's current public API documentation exposes all domains through
+    environment.config(). The serviceDomains map is keyed by domain ID, which
+    is exactly what serviceDomainDelete requires. Using this config snapshot
+    also matches the structure shown by the Railway dashboard/CLI and avoids
+    relying on a separate domains resolver that may return only the currently
+    selected/canonical service domain.
+    """
     data = gql(
-        """query($environmentId:String!,$serviceId:String!,$projectId:String!){
-             domains(
-               environmentId:$environmentId,
-               serviceId:$serviceId,
-               projectId:$projectId
-             ){
-               serviceDomains{id domain suffix}
+        """query($id:String!){
+             environment(id:$id){
+               config(decryptVariables:false)
              }
            }""",
-        {
-            "environmentId": ENVIRONMENT_ID,
-            "serviceId": SERVICE_ID,
-            "projectId": PROJECT_ID,
-        },
+        {"id": ENVIRONMENT_ID},
     )
-    domains = ((data.get("domains") or {}).get("serviceDomains")) or []
-    return [d for d in domains if isinstance(d, dict) and str(d.get("domain", "")).strip()]
+    config = ((data.get("environment") or {}).get("config")) or {}
+    if isinstance(config, str):
+        try:
+            config = json.loads(config)
+        except Exception as exc:
+            raise ApiError(f"unable to parse Railway environment config: {exc}")
+
+    service_cfg = ((config.get("services") or {}).get(SERVICE_ID)) or {}
+    networking = service_cfg.get("networking") or {}
+    raw = networking.get("serviceDomains") or {}
+
+    result = []
+    if isinstance(raw, dict):
+        for domain_id, value in raw.items():
+            if not isinstance(value, dict):
+                continue
+            domain = str(value.get("domain", "")).strip()
+            if domain:
+                result.append({"id": str(domain_id).strip(), "domain": domain})
+    elif isinstance(raw, list):
+        for value in raw:
+            if not isinstance(value, dict):
+                continue
+            domain = str(value.get("domain", "")).strip()
+            domain_id = str(value.get("id", "")).strip()
+            if domain:
+                result.append({"id": domain_id, "domain": domain})
+
+    return result
 
 
 def delete_service_domain(domain_id, domain):
@@ -229,9 +251,6 @@ def setup():
     resolve_ids()
     print("RAILWAY_API_SETUP=CHECK")
 
-    # Use the domains API rather than the mutable environment config snapshot.
-    # This gives us the actual service-domain IDs needed for safe deletion and
-    # prevents a stale config snapshot from causing another CREATE mutation.
     service_domains = list_service_domains()
     current_domain = os.environ.get("RAILWAY_PUBLIC_DOMAIN", "").strip()
 
@@ -242,9 +261,6 @@ def setup():
     elif len(service_domains) == 1:
         print(f"RAILWAY_API_PUBLIC_DOMAIN=EXISTS domain={service_domains[0].get('domain','')}")
     else:
-        # Preserve the domain Railway exposed to the current deployment when
-        # possible. Otherwise keep the first authoritative service domain and
-        # remove all additional Railway-provided domains.
         keep = None
         if current_domain:
             keep = next(
