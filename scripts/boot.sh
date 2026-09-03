@@ -18,25 +18,23 @@ echo "NODE_IDENTITY_POLICY=INITIALIZE_ONCE_REUSE_FOREVER"
 # networking/runtime/Xray readiness work begins.
 python3 /opt/xray/scripts/gateway.py >"$D/gateway.log" 2>&1 & GP=$!
 
-# Optional Railway infrastructure bootstrap. Only call the Railway API when
-# the current deployment does not already expose the required networking values.
-# Gateway is already bound to 8080 before this block.
-if [ -z "${RAILWAY_PUBLIC_DOMAIN:-}" ] || [ -z "${RAILWAY_TCP_PROXY_DOMAIN:-}" ] || [ -z "${RAILWAY_TCP_PROXY_PORT:-}" ]; then
-  if [ -n "${RAILWAY_TOKEN:-}" ] || [ -n "${RAILWAY_API_TOKEN:-}" ]; then
-    set +e
-    python3 /opt/xray/scripts/railway_setup.py
-    API_SETUP_RC=$?
-    set -e
-    if [ "$API_SETUP_RC" -eq 10 ]; then
-      echo "RAILWAY_API_REDEPLOY=REQUESTED"
-      # Networking was created and a redeploy was requested. Exit non-zero so
-      # Railway does not leave this pre-network deployment running.
-      exit 10
-    fi
-    if [ "$API_SETUP_RC" -ne 0 ]; then
-      echo "FATAL: Railway API networking setup failed; refusing to generate incomplete nodes" >&2
-      exit 1
-    fi
+# Railway networking is runtime state and must be reconciled on every startup.
+# In particular, this removes duplicate Railway-provided .up.railway.app
+# service domains instead of creating another one. Identity is never changed.
+if [ -n "${RAILWAY_TOKEN:-}" ] || [ -n "${RAILWAY_API_TOKEN:-}" ]; then
+  set +e
+  python3 /opt/xray/scripts/railway_setup.py
+  API_SETUP_RC=$?
+  set -e
+  if [ "$API_SETUP_RC" -eq 10 ]; then
+    echo "RAILWAY_API_REDEPLOY=REQUESTED"
+    # Networking was reconciled and a redeploy was requested. Exit non-zero so
+    # Railway does not leave this pre-reconciliation deployment running.
+    exit 10
+  fi
+  if [ "$API_SETUP_RC" -ne 0 ]; then
+    echo "FATAL: Railway API networking setup failed; refusing to generate incomplete nodes" >&2
+    exit 1
   fi
 fi
 
