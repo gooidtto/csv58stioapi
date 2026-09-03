@@ -30,15 +30,18 @@
 - `reality_public_key.txt`
 - `reality_short_ids.json`
 - `subscription_token.txt`
+- `identity-integrity.json`
 - `.node-identity-initialized`
 
 身份策略是 **`INITIALIZE_ONCE_REUSE_FOREVER`**：
 
 - 空 Persistent Volume：初始化一次。
-- 已初始化且完整有效：`NODE_IDENTITY=REUSED`。
-- 已初始化但身份文件缺失、损坏或不完整：**拒绝启动，不生成新身份**。
+- 已初始化且完整有效、且完整性校验通过：`NODE_IDENTITY=REUSED`。
+- 已初始化但身份文件缺失、损坏、不完整或完整性校验失败：**拒绝启动，不生成新身份**。
 - 未挂载 Persistent Volume：**拒绝启动，不生成临时身份**。
 - `generate.py` 只读取 Short IDs，不负责生成身份。
+
+`identity-integrity.json` 保存身份文件的 SHA-256 完整性封印，用于阻止一个看似格式正确但已经被修改的 UUID、REALITY key、Short ID 或 subscription token 被静默当成原身份继续运行。
 
 ## 运行时网络
 
@@ -72,4 +75,4 @@ NODE_IDENTITY=REUSED
 NODE_IDENTITY_FINGERPRINT=<same fingerprint>
 ```
 
-同一 Volume 的 fingerprint 必须保持不变。 
+同一 Volume 的 fingerprint 必须保持不变；身份完整性封印也必须保持有效。
