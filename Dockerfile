@@ -15,13 +15,15 @@ COPY config/ /opt/xray/config/
 COPY site/ /opt/xray/site/
 # Keep runtime source immutable: never patch protocol definitions during image build.
 # The build must fail if Node 5 regresses to the deprecated WebSocket transport,
-# or if the runtime loses the Railway endpoint/8080 invariants.
+# or if node identity is no longer initialized once and then reused forever.
 RUN python3 -m py_compile /opt/xray/scripts/*.py && \
+    test -x /opt/xray/scripts/identity-init.py && \
     grep -q 'vless-xhttp-cloudflare' /opt/xray/scripts/generate.py && \
     grep -q 'type":"xhttp"' /opt/xray/scripts/generate.py && \
     grep -q 'cloudflare-xhttp-tls' /opt/xray/scripts/generate.py && \
     grep -q 'tcp_proxy_expected_target":8080' /opt/xray/scripts/runtime-manifest.py && \
-    grep -q 'write_secret()' /opt/xray/scripts/boot.sh && \
+    grep -q 'identity-init.py' /opt/xray/scripts/boot.sh && \
+    grep -q 'NODE_IDENTITY_POLICY=INITIALIZE_ONCE_REUSE_FOREVER' /opt/xray/scripts/boot.sh && \
     grep -q 'GATEWAY_BIND_EARLY=PASS' /opt/xray/scripts/boot.sh && \
     grep -q 'DEPLOYMENT SUMMARY' /opt/xray/scripts/boot.sh && \
     grep -q 'application/json' /opt/xray/scripts/gateway.py && \
@@ -32,10 +34,8 @@ RUN python3 -m py_compile /opt/xray/scripts/*.py && \
     ! grep -q 'type":"ws"' /opt/xray/scripts/generate.py && \
     chmod 0755 /usr/local/bin/xray /usr/local/bin/cloudflared /opt/xray/scripts/*.sh /opt/xray/scripts/*.py && \
     chmod 0644 /opt/xray/config/* /opt/xray/site/*
-RUN echo "SOURCE_BUILD=runtime-derived BUILD_ID=runtime-derived NODE5=VLESS_XHTTP_TLS_CLOUDFLARE"
+RUN echo "SOURCE_BUILD=runtime-derived BUILD_ID=runtime-derived NODE5=VLESS_XHTTP_TLS_CLOUDFLARE NODE_IDENTITY=INITIALIZE_ONCE_REUSE_FOREVER"
 EXPOSE 8080
-
-# Verify the optional Railway API bootstrap script and runtime supervisor.
 RUN test -x /opt/xray/scripts/railway_setup.py && python3 -m py_compile /opt/xray/scripts/railway_setup.py && test -x /opt/xray/scripts/supervise.sh
 HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 CMD python3 -c "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8080/ready', timeout=3).read()"
 WORKDIR /opt/xray
