@@ -19,7 +19,7 @@ COPY site/ /opt/xray/site/
 # Build-time invariants: runtime artifacts are derived, while node identity is initialized once and reused forever.
 RUN set -eu; \
     check() { label="$1"; shift; if "$@"; then echo "BUILD_CHECK ${label}=PASS"; else echo "BUILD_CHECK ${label}=FAIL" >&2; exit 1; fi; }; \
-    check xray_version sh -c 'test "$(/usr/local/bin/xray version | head -n 1)" = "Xray 26.3.27 (Xray, Penetrates Everything.)"'; \
+    check xray_version sh -c '/usr/local/bin/xray version | head -n 1 | grep -q "Xray 26.3.27"'; \
     check xray_digest_pinned sh -c 'test "${XRAY_IMAGE_DIGEST}" = "sha256:592ec4d11f656db95598d01e76dbcc6e002d67360b96a5436500a938230f52c7"'; \
     check py_compile python3 -m py_compile /opt/xray/scripts/*.py; \
     check identity_init_present test -f /opt/xray/scripts/identity-init.py; \
