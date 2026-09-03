@@ -15,7 +15,6 @@ import subprocess
 from pathlib import Path
 
 D = Path(os.environ.get("RAILWAY_VOLUME_MOUNT_PATH", os.environ.get("DATA_DIR", "/data")))
-D.mkdir(parents=True, exist_ok=True)
 
 UUID_FILE = D / "uuid.txt"
 PRIV_FILE = D / "reality_private_key.txt"
