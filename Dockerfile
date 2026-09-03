@@ -19,8 +19,8 @@ COPY scripts/ /opt/xray/scripts/
 COPY config/ /opt/xray/config/
 COPY site/ /opt/xray/site/
 
-# Build-time invariants. The validated V5 runtime remains authoritative;
-# identity initialization is the only newly inserted persistent-volume gate.
+# Build-time invariants. Networking is runtime-derived; node identity remains
+# exclusively owned by identity-init.py on the mounted persistent volume.
 RUN set -eu; \
     check() { label="$1"; shift; if "$@"; then echo "BUILD_CHECK ${label}=PASS"; else echo "BUILD_CHECK ${label}=FAIL" >&2; exit 1; fi; }; \
     check xray_version sh -c '/usr/local/bin/xray version | head -n 1 | grep -q "Xray 26.3.27"'; \
@@ -45,7 +45,7 @@ RUN set -eu; \
     check networking_domain_count grep -q 'RAILWAY_API_PUBLIC_DOMAIN_CONFIG_COUNT=' /opt/xray/scripts/railway_setup.py; \
     check networking_domain_reconcile grep -q 'RAILWAY_API_PUBLIC_DOMAIN=RECONCILED count=1' /opt/xray/scripts/railway_setup.py; \
     check networking_tcp_count grep -q 'RAILWAY_API_TCP_PROXY_CONFIG_COUNT=' /opt/xray/scripts/railway_setup.py; \
-    check networking_tcp_ambiguous grep -q 'multiple Railway TCP proxies target application port 8080' /opt/xray/scripts/railway_setup.py; \
+    check networking_tcp_reconcile grep -q 'RAILWAY_API_TCP_PROXY=RECONCILED target=8080 count=1' /opt/xray/scripts/railway_setup.py; \
     check no_ws_legacy sh -c '! grep -q "cloudflare-ws-tls" /opt/xray/scripts/generate.py'; \
     check no_ws_transport sh -c '! grep -q "type\\\":\\\"ws\\\"" /opt/xray/scripts/generate.py'; \
     check no_runtime_identity_generation sh -c '! grep -q "secrets.token_" /opt/xray/scripts/generate.py'; \
