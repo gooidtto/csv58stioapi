@@ -1,15 +1,17 @@
 # Railway Universal Stable Deployment V5.5
 
-## 部署
+## 部署方式（一次人工配置，之后自动运行）
 
-1. 导入 GitHub。
-2. Railway 创建项目并连接仓库。
-3. 使用 `Dockerfile` 部署。
-4. 在 Service → Variables 添加 Railway Token。
-5. 如启用 Node 5，保持 Cloudflare 6 项变量完整且不要在运行期间手动修改。
-6. 程序自动检查/创建 Public Domain 与 TCP Proxy（Target 8080）。
-7. 自动请求 Redeploy，并在新 Deployment 中生成节点。
-8. 部署成功后 Logs 直接打印 `SUBSCRIPTION_URL`、Node 1–5 状态和 `/ready` 状态。
+1. 导入 GitHub 仓库并让 Railway Service 连接该仓库。
+2. Service 使用仓库中的 `Dockerfile` 部署。
+3. 在 **Service → Volumes** 创建 Persistent Volume，并将 **Mount Path 固定为 `/data`**。
+4. 在 **Service → Variables** 只需人工设置一次：`RAILWAY_TOKEN=项目 RAILWAY_TOKEN`。
+5. 点击 **Deploy**。
+6. 程序启动时首先验证 `/data` 是真实挂载的 Persistent Volume；如果为空，则只初始化一次 UUID、REALITY key、3 个 Short IDs 和 subscription token，并写入 `/data`。
+7. 程序自动检查/创建当前 Deployment 所需的 Public Domain 与 TCP Proxy（Target 8080）；如创建了网络资源，会自动请求 Redeploy。
+8. 后续 Deployment / Restart / Container recreation 都直接从 `/data` 读取并复用同一套身份；运行时 endpoint、runtime manifest 和订阅内容则根据当前 Deployment 的 Railway 网络环境重新生成。
+
+**Volume 必须在首次正式 Deploy 前完成挂载。** 程序不会把临时容器文件系统中的身份当作永久身份，也不会在缺少 Volume 时生成一套以后无法可靠保留的身份。
 
 ## 节点
 
@@ -19,17 +21,55 @@
 - Node 4：VLESS gRPC REALITY
 - Node 5（可选）：Cloudflare Tunnel + VLESS XHTTP TLS
 
-## 长期运行 / 自动自愈
+## 身份持久化策略
 
-在 `RAILWAY_TOKEN`、Node 5 Cloudflare 变量以及国家/地区等外部配置没有人为变更时，运行时自愈不会主动重新配置节点，也不会主动改变节点身份信息。
+节点身份唯一持久来源为 `/data`：
 
-- `UUID`、REALITY key 和 short IDs 使用 `/data` 中的持久化文件保存；正常重启/自愈重启会复用它们。
-- 每次启动仍以**当前 Deployment 的 Railway 网络环境**为 endpoint 权威来源，因此只有 Railway 网络本身发生变化时才会重新生成 endpoint 信息。
-- Supervisor 只做健康检查，不修改 Railway Variables、不调用节点生成逻辑来“换节点”。
-- `/ready` 检查 runtime、订阅、全部 Xray listener，以及启用 Node 5 时的 Cloudflare Tunnel。
-- 连续健康检查失败后，Supervisor 会退出容器，由 Railway `ON_FAILURE` 自动重启；重启后复用持久化节点身份。
-- Railway healthcheck 使用 `/ready`，避免“容器还活着但客户端节点已经不可用”时被错误判定为 Healthy。
+- `uuid.txt`
+- `reality_private_key.txt`
+- `reality_public_key.txt`
+- `reality_short_ids.json`
+- `subscription_token.txt`
+- `.node-identity-initialized`
 
-**重要：`/data` 必须挂载 Railway Persistent Volume。** 如果没有持久化卷，容器重建后无法保留 UUID/REALITY key/short IDs，任何代码都无法在纯临时文件系统中保证节点身份永久不变。
+身份策略是 **`INITIALIZE_ONCE_REUSE_FOREVER`**：
 
-`/health` 保持兼容；Railway 部署健康检查使用 `/ready`。
+- 空 Persistent Volume：初始化一次。
+- 已初始化且完整有效：`NODE_IDENTITY=REUSED`。
+- 已初始化但身份文件缺失、损坏或不完整：**拒绝启动，不生成新身份**。
+- 未挂载 Persistent Volume：**拒绝启动，不生成临时身份**。
+- `generate.py` 只读取 Short IDs，不负责生成身份。
+
+## 运行时网络
+
+Railway 的 Public Domain、TCP Proxy domain/port 属于当前 Deployment 的运行时环境，不属于节点身份。每次启动以当前 Railway 环境为 endpoint 权威来源，因此网络 endpoint 可以变化，而 UUID / REALITY key / Short IDs / subscription token 不变。
+
+`RAILWAY_TOKEN` 只用于 Railway API 的网络资源 bootstrap。程序不会通过 Railway API 修改节点身份、国家/地区或用户未授权的外部配置。
+
+## 长期运行
+
+主进程由 `boot.sh` 直接运行。Gateway 先绑定 8080，随后完成 runtime、订阅、Xray listener 和可选 Cloudflare Tunnel 的启动检查。Gateway 或 Xray 主进程异常退出时，容器以失败状态结束，由 Railway `ON_FAILURE` 负责重新启动；重新启动后仍从 `/data` 复用同一身份。
+
+Railway healthcheck 使用 `/health` 作为早期 liveness 检查；`boot.sh` 自己在完成运行时和 Xray readiness 检查后保持主进程运行。
+
+## 验收重点
+
+首次部署应出现：
+
+```text
+PERSISTENT_VOLUME=/data
+PERSISTENT_VOLUME_MOUNT=PASS
+NODE_IDENTITY=INITIALIZED
+NODE_IDENTITY_FINGERPRINT=<fingerprint>
+```
+
+后续重启/重新部署应出现：
+
+```text
+PERSISTENT_VOLUME=/data
+PERSISTENT_VOLUME_MOUNT=PASS
+NODE_IDENTITY=REUSED
+NODE_IDENTITY_FINGERPRINT=<same fingerprint>
+```
+
+同一 Volume 的 fingerprint 必须保持不变。 
