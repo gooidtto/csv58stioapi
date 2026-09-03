@@ -10,6 +10,12 @@ Uses Railway runtime IDs when available. Authentication is:
 The API layer is deliberately retryable for transient transport/rate-limit/
 server failures. It never changes node identity; it only reconciles runtime
 networking resources.
+
+Railway service domains are reconciled to exactly one Railway-provided
+*.up.railway.app domain. Existing duplicates are deleted instead of creating
+another domain. If RAILWAY_PUBLIC_DOMAIN identifies one of the existing
+service domains, that domain is kept so the current deployment endpoint does
+not drift unnecessarily.
 """
 import json
 import os
@@ -168,6 +174,53 @@ def resolve_ids():
             raise ApiError("unable to identify target Railway service")
 
 
+def list_service_domains():
+    """Return authoritative Railway-provided service domains with IDs."""
+    data = gql(
+        """query($environmentId:String!,$serviceId:String!,$projectId:String!){
+             domains(
+               environmentId:$environmentId,
+               serviceId:$serviceId,
+               projectId:$projectId
+             ){
+               serviceDomains{id domain suffix}
+             }
+           }""",
+        {
+            "environmentId": ENVIRONMENT_ID,
+            "serviceId": SERVICE_ID,
+            "projectId": PROJECT_ID,
+        },
+    )
+    domains = ((data.get("domains") or {}).get("serviceDomains")) or []
+    return [d for d in domains if isinstance(d, dict) and str(d.get("domain", "")).strip()]
+
+
+def delete_service_domain(domain_id, domain):
+    if not domain_id:
+        raise ApiError(f"Railway service domain has no ID: {domain}")
+    print(f"RAILWAY_API_ACTION=DELETE_DUPLICATE_PUBLIC_DOMAIN domain={domain}")
+    gql(
+        """mutation($id:String!){
+             serviceDomainDelete(id:$id)
+           }""",
+        {"id": domain_id},
+    )
+    print(f"RAILWAY_API_PUBLIC_DOMAIN=DELETED domain={domain}")
+
+
+def create_service_domain():
+    print("RAILWAY_API_ACTION=CREATE_PUBLIC_DOMAIN")
+    result = gql(
+        """mutation($input:ServiceDomainCreateInput!){
+             serviceDomainCreate(input:$input){domain}
+           }""",
+        {"input": {"serviceId": SERVICE_ID, "environmentId": ENVIRONMENT_ID}},
+    )
+    domain = (result.get("serviceDomainCreate") or {}).get("domain", "")
+    print(f"RAILWAY_API_PUBLIC_DOMAIN=CREATED domain={domain}")
+
+
 def setup():
     if not TOKEN:
         print("RAILWAY_API_SETUP=SKIP reason=no_token")
@@ -176,37 +229,45 @@ def setup():
     resolve_ids()
     print("RAILWAY_API_SETUP=CHECK")
 
-    env_data = gql(
-        """query($id:String!){
-             environment(id:$id){
-               config(decryptVariables:false)
-             }
-           }""",
-        {"id": ENVIRONMENT_ID},
-    )
-    env_config = ((env_data.get("environment") or {}).get("config")) or {}
-    if isinstance(env_config, str):
-        try:
-            env_config = json.loads(env_config)
-        except Exception:
-            env_config = {}
+    # Use the domains API rather than the mutable environment config snapshot.
+    # This gives us the actual service-domain IDs needed for safe deletion and
+    # prevents a stale config snapshot from causing another CREATE mutation.
+    service_domains = list_service_domains()
+    current_domain = os.environ.get("RAILWAY_PUBLIC_DOMAIN", "").strip()
 
-    service_cfg = ((env_config.get("services") or {}).get(SERVICE_ID)) or {}
-    networking = service_cfg.get("networking") or {}
-    service_domains = networking.get("serviceDomains") or {}
+    changed = False
+    if len(service_domains) == 0:
+        create_service_domain()
+        changed = True
+    elif len(service_domains) == 1:
+        print(f"RAILWAY_API_PUBLIC_DOMAIN=EXISTS domain={service_domains[0].get('domain','')}")
+    else:
+        # Preserve the domain Railway exposed to the current deployment when
+        # possible. Otherwise keep the first authoritative service domain and
+        # remove all additional Railway-provided domains.
+        keep = None
+        if current_domain:
+            keep = next(
+                (d for d in service_domains if str(d.get("domain", "")).strip() == current_domain),
+                None,
+            )
+        if keep is None:
+            keep = service_domains[0]
 
-    has_domain = bool(os.environ.get("RAILWAY_PUBLIC_DOMAIN", "").strip())
-    if not has_domain and isinstance(service_domains, dict):
-        for item in service_domains.values():
-            node = item if isinstance(item, dict) else {}
-            if str(node.get("domain", "")).strip():
-                has_domain = True
-                break
-    elif not has_domain and isinstance(service_domains, list):
-        has_domain = any(
-            isinstance(item, dict) and str(item.get("domain", "")).strip()
-            for item in service_domains
+        keep_domain = str(keep.get("domain", "")).strip()
+        print(
+            f"RAILWAY_API_PUBLIC_DOMAIN=DUPLICATES count={len(service_domains)} "
+            f"keep={keep_domain}"
         )
+        for domain in service_domains:
+            if domain is keep:
+                continue
+            delete_service_domain(
+                str(domain.get("id", "")).strip(),
+                str(domain.get("domain", "")).strip(),
+            )
+            changed = True
+        print(f"RAILWAY_API_PUBLIC_DOMAIN=RECONCILED count=1 keep={keep_domain}")
 
     proxies = gql(
         """query($serviceId:String!,$environmentId:String!){
@@ -221,21 +282,6 @@ def setup():
         isinstance(p, dict) and int(p.get("applicationPort", -1)) == TARGET_PORT
         for p in proxies
     )
-
-    changed = False
-
-    if not has_domain:
-        print("RAILWAY_API_ACTION=CREATE_PUBLIC_DOMAIN")
-        gql(
-            """mutation($input:ServiceDomainCreateInput!){
-                 serviceDomainCreate(input:$input){domain}
-               }""",
-            {"input": {"serviceId": SERVICE_ID, "environmentId": ENVIRONMENT_ID}},
-        )
-        print("RAILWAY_API_PUBLIC_DOMAIN=CREATED")
-        changed = True
-    else:
-        print("RAILWAY_API_PUBLIC_DOMAIN=EXISTS")
 
     if not has_tcp:
         print("RAILWAY_API_ACTION=CREATE_TCP_PROXY target=8080")
