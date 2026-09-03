@@ -22,8 +22,12 @@ RUN python3 -m py_compile /opt/xray/scripts/*.py && \
     grep -q 'cloudflare-xhttp-tls' /opt/xray/scripts/generate.py && \
     grep -q 'tcp_proxy_expected_target":8080' /opt/xray/scripts/runtime-manifest.py && \
     grep -q 'write_secret()' /opt/xray/scripts/boot.sh && \
-    grep -q 'GATEWAY_BIND_EARLY=PASS' /opt/xray/scripts/boot.sh &&     grep -q 'DEPLOYMENT SUMMARY' /opt/xray/scripts/boot.sh &&     grep -q 'application/json' /opt/xray/scripts/gateway.py && \
+    grep -q 'GATEWAY_BIND_EARLY=PASS' /opt/xray/scripts/boot.sh && \
+    grep -q 'DEPLOYMENT SUMMARY' /opt/xray/scripts/boot.sh && \
+    grep -q 'application/json' /opt/xray/scripts/gateway.py && \
     grep -q 'CLOUDFLARED_READY=PASS' /opt/xray/scripts/boot.sh && \
+    grep -q 'READY_UNHEALTHY' /opt/xray/scripts/supervise.sh && \
+    grep -q 'same persisted' /opt/xray/scripts/supervise.sh && \
     ! grep -q 'cloudflare-ws-tls' /opt/xray/scripts/generate.py && \
     ! grep -q 'type":"ws"' /opt/xray/scripts/generate.py && \
     chmod 0755 /usr/local/bin/xray /usr/local/bin/cloudflared /opt/xray/scripts/*.sh /opt/xray/scripts/*.py && \
@@ -31,8 +35,8 @@ RUN python3 -m py_compile /opt/xray/scripts/*.py && \
 RUN echo "SOURCE_BUILD=runtime-derived BUILD_ID=runtime-derived NODE5=VLESS_XHTTP_TLS_CLOUDFLARE"
 EXPOSE 8080
 
-# Verify the optional Railway API bootstrap script.
-RUN test -x /opt/xray/scripts/railway_setup.py && python3 -m py_compile /opt/xray/scripts/railway_setup.py
-HEALTHCHECK --interval=30s --timeout=5s --start-period=5s --retries=3 CMD python3 -c "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8080/health', timeout=3).read()"
+# Verify the optional Railway API bootstrap script and runtime supervisor.
+RUN test -x /opt/xray/scripts/railway_setup.py && python3 -m py_compile /opt/xray/scripts/railway_setup.py && test -x /opt/xray/scripts/supervise.sh
+HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 CMD python3 -c "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8080/ready', timeout=3).read()"
 WORKDIR /opt/xray
-ENTRYPOINT ["/opt/xray/scripts/boot.sh"]
+ENTRYPOINT ["/opt/xray/scripts/supervise.sh"]
