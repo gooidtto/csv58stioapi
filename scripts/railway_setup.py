@@ -6,15 +6,22 @@ Uses Railway runtime IDs when available. Authentication is:
 - If that fails, the same RAILWAY_TOKEN is retried as a Bearer token so a
   Workspace/Account token can also be used.
 - RAILWAY_API_TOKEN is supported as a Bearer-token compatibility variable.
+
+The API layer is deliberately retryable for transient transport/rate-limit/
+server failures. It never changes node identity; it only reconciles runtime
+networking resources.
 """
 import json
 import os
 import sys
+import time
 import urllib.error
 import urllib.request
 
 API_URL = "https://backboard.railway.com/graphql/v2"
 TARGET_PORT = 8080
+API_RETRIES = max(1, int(os.environ.get("RAILWAY_API_RETRIES", "3")))
+API_RETRY_DELAY = max(1.0, float(os.environ.get("RAILWAY_API_RETRY_DELAY", "2.5")))
 
 PROJECT_TOKEN = os.environ.get("RAILWAY_TOKEN", "").strip()
 ACCOUNT_TOKEN = os.environ.get("RAILWAY_API_TOKEN", "").strip()
@@ -30,10 +37,10 @@ class ApiError(RuntimeError):
     pass
 
 
-def _request(query, variables, mode):
+def _request_once(query, variables, mode):
     headers = {
         "Content-Type": "application/json",
-        "User-Agent": "railway-universal-stable/5.5",
+        "User-Agent": "railway-universal-stable/5.6",
     }
     if mode == "project":
         headers["Project-Access-Token"] = TOKEN
@@ -51,13 +58,40 @@ def _request(query, variables, mode):
             body = json.loads(resp.read().decode())
     except urllib.error.HTTPError as exc:
         detail = exc.read().decode(errors="replace")
-        raise ApiError(f"HTTP {exc.code}: {detail[:500]}")
+        retryable = exc.code == 429 or 500 <= exc.code <= 599
+        error = ApiError(f"HTTP {exc.code}: {detail[:500]}")
+        if retryable:
+            error.retryable = True
+        raise error
+    except (urllib.error.URLError, TimeoutError, OSError) as exc:
+        error = ApiError(f"request failed: {exc}")
+        error.retryable = True
+        raise error
     except Exception as exc:
         raise ApiError(f"request failed: {exc}")
 
     if body.get("errors"):
+        # GraphQL errors are normally semantic/auth/schema errors. Do not
+        # blindly repeat mutations on these responses.
         raise ApiError(json.dumps(body["errors"], ensure_ascii=False)[:1200])
     return body.get("data") or {}
+
+
+def _request(query, variables, mode):
+    last = None
+    for attempt in range(1, API_RETRIES + 1):
+        try:
+            return _request_once(query, variables, mode)
+        except ApiError as exc:
+            last = exc
+            if not getattr(exc, "retryable", False) or attempt >= API_RETRIES:
+                raise
+            print(
+                f"RAILWAY_API_RETRY={attempt}/{API_RETRIES} "
+                f"delay={API_RETRY_DELAY:g}s reason=transient"
+            )
+            time.sleep(API_RETRY_DELAY)
+    raise last or ApiError("Railway API request failed")
 
 
 def gql(query, variables=None):
@@ -85,8 +119,6 @@ def gql(query, variables=None):
                     return data
                 except ApiError:
                     raise project_error
-            # Retry the same RAILWAY_TOKEN as Bearer. This is what makes the
-            # token shown as a workspace/account-scoped token usable here.
             try:
                 data = _request(query, variables or {}, "bearer")
                 AUTH_MODE = "bearer"
@@ -102,8 +134,6 @@ def gql(query, variables=None):
 def resolve_ids():
     global PROJECT_ID, ENVIRONMENT_ID, SERVICE_ID
 
-    # Railway normally injects all three IDs into the running deployment.
-    # Do not call projectToken merely to rediscover them.
     if not PROJECT_ID or not ENVIRONMENT_ID:
         if not PROJECT_TOKEN:
             raise ApiError("Railway project/environment IDs are unavailable")
@@ -146,9 +176,6 @@ def setup():
     resolve_ids()
     print("RAILWAY_API_SETUP=CHECK")
 
-    # Railway's current `domains` query returns an AllDomains object, not a
-    # scalar/list. Read the environment config and inspect the service's
-    # networking.serviceDomains instead of selecting `domains` directly.
     env_data = gql(
         """query($id:String!){
              environment(id:$id){
