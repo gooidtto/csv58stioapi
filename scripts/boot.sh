@@ -12,6 +12,7 @@ export DATA_DIR="$D"
 # Hard precondition: identity-init.py verifies that D is a real mounted
 # persistent volume before any identity or runtime data is touched.
 python3 /opt/xray/scripts/identity-init.py
+echo "NODE_IDENTITY_POLICY=INITIALIZE_ONCE_REUSE_FOREVER"
 
 # Gateway early bind: keep Railway target port 8080 alive before
 # networking/runtime/Xray readiness work begins.
