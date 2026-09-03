@@ -2,7 +2,8 @@
 """Idempotent Railway networking bootstrap.
 
 The script reconciles runtime networking only. It never creates or changes node
-identity. Railway-provided service domains are kept at exactly one.
+identity. Railway-provided service domains are kept at exactly one, and the TCP
+proxy target is validated before runtime artifacts are generated.
 """
 import json
 import os
@@ -171,7 +172,11 @@ def list_service_domains():
             raise ApiError(f"unable to parse Railway environment config: {exc}")
     service_cfg = ((config.get("services") or {}).get(SERVICE_ID)) or {}
     networking = service_cfg.get("networking") or {}
-    return _normalize_domain_entries(networking.get("serviceDomains") or {})
+    domains = _normalize_domain_entries(networking.get("serviceDomains") or {})
+    print(f"RAILWAY_API_PUBLIC_DOMAIN_CONFIG_COUNT={len(domains)}")
+    if domains:
+        print("RAILWAY_API_PUBLIC_DOMAIN_CONFIG=" + ",".join(d["domain"] for d in domains))
+    return domains
 
 
 def delete_service_domain(domain_id, domain, config_key=""):
@@ -210,6 +215,8 @@ def create_service_domain():
         {"input": {"serviceId": SERVICE_ID, "environmentId": ENVIRONMENT_ID}},
     )
     domain = (result.get("serviceDomainCreate") or {}).get("domain", "")
+    if not domain:
+        raise ApiError("serviceDomainCreate returned an empty domain")
     print(f"RAILWAY_API_PUBLIC_DOMAIN=CREATED domain={domain}")
 
 
@@ -220,7 +227,34 @@ def ensure_tcp_proxy():
            }""",
         {"serviceId": SERVICE_ID, "environmentId": ENVIRONMENT_ID},
     ).get("tcpProxies") or []
-    if any(isinstance(p, dict) and int(p.get("applicationPort", -1)) == TARGET_PORT for p in proxies):
+    normalized = []
+    for proxy in proxies:
+        if not isinstance(proxy, dict):
+            continue
+        try:
+            application_port = int(proxy.get("applicationPort", -1))
+            proxy_port = int(proxy.get("proxyPort", -1))
+        except (TypeError, ValueError):
+            application_port = -1
+            proxy_port = -1
+        normalized.append({
+            "id": str(proxy.get("id", "")),
+            "domain": str(proxy.get("domain", "")),
+            "proxyPort": proxy_port,
+            "applicationPort": application_port,
+        })
+    target = [p for p in normalized if p["applicationPort"] == TARGET_PORT]
+    print(f"RAILWAY_API_TCP_PROXY_CONFIG_COUNT={len(normalized)}")
+    if normalized:
+        print("RAILWAY_API_TCP_PROXY_CONFIG=" + ",".join(
+            f"{p['domain']}:{p['proxyPort']}->{p['applicationPort']}" for p in normalized
+        ))
+    if len(target) > 1:
+        raise ApiError("multiple Railway TCP proxies target application port 8080; refusing ambiguous runtime endpoint")
+    if target:
+        proxy = target[0]
+        if not proxy["domain"] or not (1 <= proxy["proxyPort"] <= 65535):
+            raise ApiError("Railway TCP proxy targeting 8080 has invalid domain or proxy port")
         print("RAILWAY_API_TCP_PROXY=EXISTS target=8080")
         return False
     print("RAILWAY_API_ACTION=CREATE_TCP_PROXY target=8080")
@@ -229,6 +263,8 @@ def ensure_tcp_proxy():
         {"input": {"serviceId": SERVICE_ID, "environmentId": ENVIRONMENT_ID, "applicationPort": TARGET_PORT}},
     )
     proxy = result.get("tcpProxyCreate") or {}
+    if not proxy.get("domain") or not proxy.get("proxyPort"):
+        raise ApiError("tcpProxyCreate returned incomplete proxy information")
     print(f"RAILWAY_API_TCP_PROXY=CREATED domain={proxy.get('domain','')} port={proxy.get('proxyPort','')} target=8080")
     return True
 
@@ -248,7 +284,10 @@ def setup():
         create_service_domain()
         changed = True
     elif len(service_domains) == 1:
-        print(f"RAILWAY_API_PUBLIC_DOMAIN=EXISTS domain={service_domains[0]['domain']}")
+        configured = service_domains[0]["domain"]
+        print(f"RAILWAY_API_PUBLIC_DOMAIN=EXISTS domain={configured}")
+        if current_domain and current_domain != configured:
+            print(f"RAILWAY_API_PUBLIC_DOMAIN_ENV_MISMATCH env={current_domain} config={configured}")
     else:
         keep = next((d for d in service_domains if d["domain"] == current_domain), None)
         if keep is None:
