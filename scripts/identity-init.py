@@ -180,8 +180,6 @@ def generate_identity() -> None:
     token = secrets.token_urlsafe(32)
     ids = [secrets.token_hex(6) for _ in range(3)]
 
-    # Identity files are written atomically and fsynced. The integrity seal is
-    # written before the marker, so the marker can only mean a complete sealed set.
     atomic_write(UUID_FILE, uuid)
     atomic_write(PRIV_FILE, private)
     atomic_write(PUB_FILE, public)
@@ -215,7 +213,7 @@ def main() -> None:
         # One-time seal migration for the identity created by the previous
         # identity-init revision. No identity value is changed or regenerated.
         write_seal()
-        emit_identity_status("REUSED_SEALED")
+        emit_identity_status("REUSED")
         return
 
     if complete:
